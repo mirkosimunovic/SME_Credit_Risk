@@ -1,0 +1,22 @@
+# SME Credit Risk Academic & Technical Governance
+
+## 1. Academic & Technical Governance Rules
+- **Rule 1 (Data Balance):** Banking datasets are heavily imbalanced. Always use SMOTE or equivalent resampling techniques for model training.
+- **Rule 2 (Statistical Rigor):** Use 5-fold cross-validation for all model benchmarks. Never report Accuracy alone; always report Recall and AUC-ROC.
+- **Rule 3 (Transparency):** All gradient boosting models (XGBoost, LightGBM, CatBoost) must be accompanied by a SHAP interpretation script.
+- **Rule 4 (Explanation Stability):** Any feature identified as "important" must pass a Kendall's W stability test across 5 random seeds to satisfy regulatory "Right to Explanation" rules.
+
+## 2. Project Directory Structure
+Always read datasets and write scripts/artifacts according to this exact folder layout:
+- Raw Datasets: data/raw/
+- Processed Data: data/processed/
+- Output Figures: outputs/figures/ (ROC curves, SHAP summary, DAGs)
+- Metrics & Results: outputs/results/ (metrics_benchmark.csv)
+- Notebooks: notebooks/
+- Production Scripts: scripts/
+
+## 3. Remote Cloud Environment Guidelines (Colab & Kaggle)
+- **Role Separation:** Local Cursor is the "Brain" (logic and architecture). Remote Google Colab and Kaggle runtimes are the "Muscle" (heavy computation on cloud GPUs).
+- **Package Installation:** If libraries are missing on remote kernels, use a silent install cell: `!pip install -q xgboost lightgbm catboost optuna shap dowhy`.
+- **Headless Visualization:** When writing plotting scripts, configure matplotlib to run headlessly using `import matplotlib; matplotlib.use('Agg')` before importing `pyplot`. Do not use `plt.show()`. Always save plots directly to `outputs/figures/` using `plt.savefig()`.
+- **Secrets & Keys:** Never hardcode API tokens or passwords. For Kaggle/Hugging Face access, read them from the local `.env` file, or call Colab's secret vault using `from google.colab import userdata`.

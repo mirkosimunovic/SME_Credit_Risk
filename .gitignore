@@ -1,0 +1,18 @@
+# Credentials and Secrets (aligned with technical protocol)
+.env
+
+# Large Datasets (SBA National is ~1M rows; do not commit raw data)
+data/raw/
+data/processed/
+data/docs/
+
+# Python Virtual Environments & Packages
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE and OS specific files
+.DS_Store
+.vscode/
+.cursor/
