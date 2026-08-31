@@ -1,4 +1,4 @@
-"""Two-step SME credit-risk training pipeline (JRFM-oriented).
+"""Two-step SME credit-risk training pipeline .
 
 STEP 1 — Stratified 5-fold CV: leak-proof per-fold StandardScaler on
           continuous features only; cost-sensitive class weights (no SMOTE);
