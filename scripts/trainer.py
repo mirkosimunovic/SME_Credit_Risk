@@ -160,6 +160,7 @@ def identify_continuous_columns(frame: pd.DataFrame) -> list[str]:
         col
         for col in frame.columns
         if int(frame[col].nunique(dropna=False)) > CARDINALITY_THRESHOLD
+        and col not in ["NAICS"]  # we do not want to scale the NAICS code
     ]
 
 
@@ -365,6 +366,26 @@ def plot_cv_roc(tpr_store: dict[str, list[np.ndarray]], mean_fpr: np.ndarray) ->
     return out_path
 
 
+def save_champion_native(name: str, model, dest: Path) -> None:
+    """Write each booster in its native audit format.
+
+    LGBMClassifier (sklearn API) does not expose ``save_model``; the fitted
+    booster does. XGBoost and CatBoost sklearn wrappers do expose it.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if name == "LightGBM":
+        booster = getattr(model, "booster_", None)
+        if booster is None:
+            raise AttributeError(
+                "LightGBM model has no booster_ after fit; cannot serialize."
+            )
+        booster.save_model(str(dest))
+        return
+    if not hasattr(model, "save_model"):
+        raise AttributeError(f"{type(model).__name__} has no save_model().")
+    model.save_model(str(dest))
+
+
 def run_final_fit(X: pd.DataFrame, y: pd.Series) -> None:
     """STEP 2: global scaler + champion serialization. Not used for reported metrics."""
     print("\n" + "=" * 78)
@@ -406,7 +427,7 @@ def run_final_fit(X: pd.DataFrame, y: pd.Series) -> None:
         model = champions[name]
         model.fit(X_scaled, y)
         dest = save_paths[name]
-        model.save_model(str(dest))
+        save_champion_native(name, model, dest)
         print(f"  Serialized {name} -> {dest.relative_to(PROJECT_ROOT)}")
 
     print("\nSTEP 2 complete. Downstream SHAP/DoWhy scripts must:")
