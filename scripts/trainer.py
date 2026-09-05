@@ -6,7 +6,7 @@ Uses the chronological, un-imputed splits from scripts/preprocess.py:
     data/processed/X_oot.csv,   y_oot.csv
 
 STEP 1 — Stratified 5-fold CV on the training partition only.
-          FaissImputer + StandardScaler are fit on the training fold slice
+          FastKNNImputer + StandardScaler are fit on the training fold slice
           and applied to that fold's validation slice. Never fit on OOT.
           Metrics: Recall, AUC-ROC, AUC-PR, F1, Lift@10%.
 
@@ -36,7 +36,7 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from fknni import FaissImputer
+from fknni import FastKNNImputer
 from sklearn.metrics import (
     auc,
     average_precision_score,
@@ -188,18 +188,18 @@ def identify_continuous(frame: pd.DataFrame) -> list[str]:
     ]
 
 
-def make_imputer() -> FaissImputer:
-    """GPU-backed kNN imputer (fknni). Drop-in for sklearn KNNImputer."""
-    return FaissImputer(n_neighbors=5, strategy="mean")
+def make_imputer() -> FastKNNImputer:
+    """fknni FastKNNImputer (current public name; FaissImputer was removed)."""
+    return FastKNNImputer(n_neighbors=5, strategy="mean")
 
 
 def impute_and_scale(
     X_fit: pd.DataFrame,
     X_apply: pd.DataFrame,
-    imputer: FaissImputer | None = None,
+    imputer: FastKNNImputer | None = None,
     scaler: StandardScaler | None = None,
     continuous_cols: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, FaissImputer, StandardScaler, list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, FastKNNImputer, StandardScaler, list[str]]:
     """Leak-proof numeric prep: encode -> impute -> scale continuous columns.
 
     If imputer/scaler are None, they are fit on X_fit only.
@@ -209,7 +209,7 @@ def impute_and_scale(
 
     if imputer is None:
         imputer = make_imputer()
-        print("    Fitting FaissImputer on the training slice ...", flush=True)
+        print("    Fitting FastKNNImputer on the training slice ...", flush=True)
         imputer.fit(X_fit_enc)
 
     X_fit_imp = pd.DataFrame(
@@ -318,7 +318,7 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     print("\n" + "=" * 78)
     print("STEP 1  Stratified 5-fold CV on X_train / y_train")
     print("=" * 78)
-    print("Imputer: FaissImputer(n_neighbors=5, strategy='mean') — fit on train fold only.")
+    print("Imputer: FastKNNImputer(n_neighbors=5, strategy='mean') — fit on train fold only.")
     print("Scaler:  StandardScaler on continuous columns (nunique > 10) — train fold only.")
     print("Imbalance: scale_pos_weight = n_neg / n_pos on the training fold.")
     print("OOT is held out of this entire loop.\n")
