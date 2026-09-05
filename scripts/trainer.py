@@ -1,13 +1,23 @@
-"""Two-step SME credit-risk training pipeline .
+"""Two-step SME credit-risk trainer (JRFM-oriented).
 
-STEP 1 — Stratified 5-fold CV: leak-proof per-fold StandardScaler on
-          continuous features only; cost-sensitive class weights (no SMOTE);
-          Recall / AUC-ROC / F1; headless ROC figure.
+Uses the chronological, un-imputed splits from scripts/preprocess.py:
 
-STEP 2 — Final fit on 100% of the data: global scaler + native serialization
-          of XGBoost, CatBoost, and LightGBM for SHAP / causal scripts.
+    data/processed/X_train.csv, y_train.csv
+    data/processed/X_oot.csv,   y_oot.csv
+
+STEP 1 — Stratified 5-fold CV on the training partition only.
+          FaissImputer + StandardScaler are fit on the training fold slice
+          and applied to that fold's validation slice. Never fit on OOT.
+          Metrics: Recall, AUC-ROC, AUC-PR, F1, Lift@10%.
+
+STEP 2 — Fit a global imputer and scaler on 100% of X_train, train the
+          three boosting champions, serialize native artifacts.
+
+STEP 3 — Score the chronological OOT holdout with those frozen artifacts
+          and write a headless ROC comparison.
 
 Target: MIS_Status (0 = Paid in Full, 1 = Default).
+SMOTE is not used; class imbalance is handled with scale_pos_weight.
 """
 
 from __future__ import annotations
@@ -26,10 +36,10 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from fknni import FaissImputer
 from sklearn.metrics import (
     auc,
+    average_precision_score,
     f1_score,
     recall_score,
     roc_auc_score,
@@ -46,10 +56,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------------------------------------------------------------------------
-# Paths (resolved from this file so the script is cwd-independent)
+# Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "processed" / "processed_sme_final.csv"
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 FIGURES_DIR = PROJECT_ROOT / "outputs" / "figures"
 RESULTS_DIR = PROJECT_ROOT / "outputs" / "results"
 ARTIFACTS_DIR = PROJECT_ROOT / "models" / "artifacts"
@@ -57,18 +67,11 @@ ARTIFACTS_DIR = PROJECT_ROOT / "models" / "artifacts"
 TARGET_COL = "MIS_Status"
 N_SPLITS = 5
 RANDOM_STATE = 42
-CARDINALITY_THRESHOLD = 10  # nunique > 10 => continuous; else leave unscaled
-N_ROC_POINTS = 100
-POSITIVE_LABEL = 1  # Default
+CARDINALITY_THRESHOLD = 10  # nunique > 10 => continuous (scaled); else leave raw
+LIFT_FRACTION = 0.10
+POSITIVE_LABEL = 1
 
-MODEL_ORDER = [
-    "Logistic Regression",
-    "Random Forest",
-    "XGBoost",
-    "LightGBM",
-    "CatBoost",
-]
-CHAMPION_MODELS = ("XGBoost", "LightGBM", "CatBoost")
+MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost"]
 
 # Standard published-style tree baselines (not nested-CV tuned).
 XGB_BASELINE = dict(
@@ -105,229 +108,266 @@ CATBOOST_BASELINE = dict(
     verbose=False,
     allow_writing_files=False,
 )
-RF_BASELINE = dict(
-    n_estimators=200,
-    max_depth=20,
-    min_samples_leaf=2,
-    max_features="sqrt",
-    n_jobs=-1,
-    random_state=RANDOM_STATE,
-)
 
 
-def ensure_output_dirs() -> None:
-    """Create artifact folders if a fresh clone / cloud runtime is empty."""
+def ensure_dirs() -> None:
     for directory in (FIGURES_DIR, RESULTS_DIR, ARTIFACTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
         print(f"  [ok] {directory.relative_to(PROJECT_ROOT)}")
 
 
-def load_dataset(path: Path) -> tuple[pd.DataFrame, pd.Series]:
-    if not path.exists():
+def load_xy(split: str) -> tuple[pd.DataFrame, pd.Series]:
+    """Load one chronological split. Target is always MIS_Status."""
+    x_path = PROCESSED_DIR / f"X_{split}.csv"
+    y_path = PROCESSED_DIR / f"y_{split}.csv"
+    if not x_path.exists() or not y_path.exists():
         raise FileNotFoundError(
-            f"Preprocessed dataset not found: {path}\n"
-            "Expected Week-1 output at data/processed/processed_sme_final.csv"
+            f"Missing {split} split. Run scripts/preprocess.py first.\n"
+            f"  expected {x_path}\n  expected {y_path}"
         )
-
-    print(f"Loading {path.relative_to(PROJECT_ROOT)} ...")
-    df = pd.read_csv(path, low_memory=False)
-    if TARGET_COL not in df.columns:
-        raise KeyError(f"Target column '{TARGET_COL}' is missing from {path.name}")
-
-    y = df[TARGET_COL].astype(int)
-    X = df.drop(columns=[TARGET_COL]).apply(pd.to_numeric, errors="coerce")
-    if X.empty:
-        raise ValueError("Feature matrix is empty after dropping the target.")
-    if X.isna().any().any():
-        n_missing = int(X.isna().sum().sum())
-        print(f"  Warning: {n_missing:,} missing feature values; median-imputing.")
-        X = X.fillna(X.median(numeric_only=True))
-
-    n_neg, n_pos = int((y == 0).sum()), int((y == 1).sum())
-    if n_pos == 0 or n_neg == 0:
-        raise ValueError("Target is degenerate (only one class present).")
-
-    print(f"  Rows: {len(X):,} | Features: {X.shape[1]}")
-    print(f"  Paid in Full (0): {n_neg:,} | Default (1): {n_pos:,}")
-    print(f"  Empirical default rate: {n_pos / len(y):.4f}")
-    print(f"  Global scale_pos_weight (n0/n1): {n_neg / n_pos:.4f}")
+    X = pd.read_csv(x_path, low_memory=False)
+    y = pd.read_csv(y_path, low_memory=False)
+    if TARGET_COL not in y.columns:
+        # single-column file with no header, or a different name
+        y = y.iloc[:, 0]
+    else:
+        y = y[TARGET_COL]
+    y = y.astype(int)
+    if len(X) != len(y):
+        raise ValueError(f"{split}: X has {len(X):,} rows but y has {len(y):,}.")
+    print(
+        f"  Loaded {split}: X={X.shape}  defaults={int(y.sum()):,}  "
+        f"rate={float(y.mean()):.6f}"
+    )
     return X, y
 
 
-def identify_continuous_columns(frame: pd.DataFrame) -> list[str]:
-    """High-cardinality numeric features (nunique > 10). Binary dummies are excluded."""
+def encode_non_numeric(X_fit: pd.DataFrame, X_apply: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Map leftover string columns (State, RevLineCr, LowDoc, ...) to integers.
+
+    Codes are learned on X_fit only. Unseen / missing tokens become NaN so the
+    fold imputer — not this encoder — fills them. Numeric columns pass through.
+    """
+    X_tr = X_fit.copy()
+    X_ap = X_apply.copy()
+    encodings: dict[str, dict] = {}
+
+    for col in X_tr.columns:
+        # Already numeric (including columns that are float with NaNs).
+        if pd.api.types.is_numeric_dtype(X_tr[col]):
+            X_tr[col] = pd.to_numeric(X_tr[col], errors="coerce")
+            X_ap[col] = pd.to_numeric(X_ap[col], errors="coerce")
+            continue
+
+        # Try a silent numeric cast first (e.g. '1.0' stored as object).
+        as_num_tr = pd.to_numeric(X_tr[col], errors="coerce")
+        as_num_ap = pd.to_numeric(X_ap[col], errors="coerce")
+        mostly_numeric = as_num_tr.notna().mean() >= 0.95
+        if mostly_numeric:
+            X_tr[col] = as_num_tr
+            X_ap[col] = as_num_ap
+            continue
+
+        tokens_tr = X_tr[col].where(X_tr[col].notna(), np.nan).astype("string")
+        tokens_ap = X_ap[col].where(X_ap[col].notna(), np.nan).astype("string")
+        vocab = pd.Index(tokens_tr.dropna().unique())
+        mapping = {str(v): i for i, v in enumerate(vocab)}
+        encodings[col] = mapping
+        X_tr[col] = tokens_tr.map(mapping).astype(float)
+        X_ap[col] = tokens_ap.map(mapping).astype(float)
+
+    return X_tr, X_ap, encodings
+
+
+def identify_continuous(frame: pd.DataFrame) -> list[str]:
+    """High-cardinality numeric features. Binary / low-card flags stay unscaled."""
     return [
         col
         for col in frame.columns
         if int(frame[col].nunique(dropna=False)) > CARDINALITY_THRESHOLD
-        and col not in ["NAICS"]  # we do not want to scale the NAICS code
     ]
 
 
-def apply_scaler_to_continuous(
-    X_train: pd.DataFrame,
-    X_apply: pd.DataFrame,
-    continuous_cols: list[str],
-    scaler: StandardScaler | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, StandardScaler]:
-    """Fit scaler on training continuous columns only; transform train and apply sets.
+def make_imputer() -> FaissImputer:
+    """GPU-backed kNN imputer (fknni). Drop-in for sklearn KNNImputer."""
+    return FaissImputer(n_neighbors=5, strategy="mean")
 
-    Binary / low-cardinality columns are copied through unchanged.
+
+def impute_and_scale(
+    X_fit: pd.DataFrame,
+    X_apply: pd.DataFrame,
+    imputer: FaissImputer | None = None,
+    scaler: StandardScaler | None = None,
+    continuous_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, FaissImputer, StandardScaler, list[str]]:
+    """Leak-proof numeric prep: encode -> impute -> scale continuous columns.
+
+    If imputer/scaler are None, they are fit on X_fit only.
     """
-    X_train_out = X_train.copy()
-    X_apply_out = X_apply.copy()
-    if not continuous_cols:
-        print("  Warning: no continuous columns identified; skipping StandardScaler.")
-        return X_train_out, X_apply_out, scaler or StandardScaler()
+    X_fit_enc, X_apply_enc, _ = encode_non_numeric(X_fit, X_apply)
+    feature_cols = list(X_fit_enc.columns)
+
+    if imputer is None:
+        imputer = make_imputer()
+        print("    Fitting FaissImputer on the training slice ...", flush=True)
+        imputer.fit(X_fit_enc)
+
+    X_fit_imp = pd.DataFrame(
+        imputer.transform(X_fit_enc),
+        columns=feature_cols,
+        index=X_fit_enc.index,
+    )
+    X_apply_imp = pd.DataFrame(
+        imputer.transform(X_apply_enc),
+        columns=feature_cols,
+        index=X_apply_enc.index,
+    )
+
+    if continuous_cols is None:
+        continuous_cols = identify_continuous(X_fit_imp)
+    print(f"    Continuous columns scaled ({len(continuous_cols)}): {continuous_cols}")
 
     if scaler is None:
         scaler = StandardScaler()
-        scaler.fit(X_train[continuous_cols])
+        if continuous_cols:
+            scaler.fit(X_fit_imp[continuous_cols])
 
-    X_train_out[continuous_cols] = scaler.transform(X_train[continuous_cols])
-    X_apply_out[continuous_cols] = scaler.transform(X_apply[continuous_cols])
-    return X_train_out, X_apply_out, scaler
+    X_fit_out = X_fit_imp.copy()
+    X_apply_out = X_apply_imp.copy()
+    if continuous_cols:
+        X_fit_out[continuous_cols] = scaler.transform(X_fit_imp[continuous_cols])
+        X_apply_out[continuous_cols] = scaler.transform(X_apply_imp[continuous_cols])
+    return X_fit_out, X_apply_out, imputer, scaler, continuous_cols
 
 
-def scale_pos_weight_from_labels(y_train: pd.Series | np.ndarray) -> float:
-    y_arr = np.asarray(y_train)
+def scale_pos_weight(y: pd.Series | np.ndarray) -> float:
+    """XGBoost / LightGBM / CatBoost convention: n_neg / n_pos.
+
+    This is the inverse of the positive prevalence. Using n_pos / n_neg would
+    under-weight the default class and collapse recall on a rare event.
+    """
+    y_arr = np.asarray(y)
     n_neg = int((y_arr == 0).sum())
     n_pos = int((y_arr == 1).sum())
     if n_pos == 0:
-        raise ValueError("Training split contains no default (class 1) labels.")
+        raise ValueError("Training slice contains no default (class 1) labels.")
     return n_neg / n_pos
 
 
-def build_models(scale_pos_weight: float) -> dict:
-    """Cost-sensitive estimators. SMOTE is intentionally not used.
-
-    Resampling would distort predicted default probabilities required by
-    expected-loss and SHAP analyses.
-    """
+def build_models(spw: float) -> dict:
     return {
-        "Logistic Regression": LogisticRegression(
-            class_weight="balanced",
-            max_iter=2000,
-            solver="lbfgs",
-            random_state=RANDOM_STATE,
-        ),
-        "Random Forest": RandomForestClassifier(
-            class_weight="balanced",
-            **RF_BASELINE,
-        ),
-        "XGBoost": XGBClassifier(
-            scale_pos_weight=scale_pos_weight,
-            **XGB_BASELINE,
-        ),
-        "LightGBM": LGBMClassifier(
-            scale_pos_weight=scale_pos_weight,
-            **LGBM_BASELINE,
-        ),
-        "CatBoost": CatBoostClassifier(
-            auto_class_weights="Balanced",
-            **CATBOOST_BASELINE,
-        ),
+        "XGBoost": XGBClassifier(scale_pos_weight=spw, **XGB_BASELINE),
+        "LightGBM": LGBMClassifier(scale_pos_weight=spw, **LGBM_BASELINE),
+        "CatBoost": CatBoostClassifier(scale_pos_weight=spw, **CATBOOST_BASELINE),
     }
 
 
-def evaluate_fold(y_true, y_pred, y_proba) -> dict[str, float]:
+def lift_at_fraction(y_true, y_proba, fraction: float = LIFT_FRACTION) -> float:
+    """Default rate in the top-`fraction` scored loans / base default rate."""
+    y_true = np.asarray(y_true)
+    y_proba = np.asarray(y_proba)
+    n = len(y_true)
+    if n == 0:
+        return float("nan")
+    base = float(y_true.mean())
+    if base <= 0:
+        return float("nan")
+    n_top = max(1, int(np.ceil(n * fraction)))
+    order = np.argsort(y_proba)[::-1][:n_top]
+    return float(y_true[order].mean() / base)
+
+
+def evaluate(y_true, y_proba) -> dict[str, float]:
+    y_pred = (np.asarray(y_proba) >= 0.5).astype(int)
     return {
         "recall": float(recall_score(y_true, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)),
         "auc_roc": float(roc_auc_score(y_true, y_proba)),
+        "auc_pr": float(average_precision_score(y_true, y_proba)),
         "f1": float(f1_score(y_true, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)),
+        "lift_at_10": lift_at_fraction(y_true, y_proba, LIFT_FRACTION),
     }
 
 
-def interpolate_tpr(y_true, y_proba, mean_fpr: np.ndarray) -> np.ndarray:
-    fpr, tpr, _ = roc_curve(y_true, y_proba, pos_label=POSITIVE_LABEL)
-    interp_tpr = np.interp(mean_fpr, fpr, tpr)
-    interp_tpr[0] = 0.0
-    interp_tpr[-1] = 1.0
-    return interp_tpr
+def print_metrics(label: str, metrics: dict[str, float]) -> None:
+    print(
+        f"    {label:<22} "
+        f"Recall={metrics['recall']:.4f}  "
+        f"AUC-ROC={metrics['auc_roc']:.4f}  "
+        f"AUC-PR={metrics['auc_pr']:.4f}  "
+        f"F1={metrics['f1']:.4f}  "
+        f"Lift@10%={metrics['lift_at_10']:.3f}"
+    )
 
 
-def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, dict, np.ndarray]:
-    """STEP 1: leak-proof stratified evaluation. Does not persist models."""
+def save_champion(name: str, model, dest: Path) -> None:
+    """Native audit formats. LGBMClassifier.save_model lives on booster_."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if name == "LightGBM":
+        booster = getattr(model, "booster_", None)
+        if booster is None:
+            raise AttributeError("LightGBM model has no booster_ after fit.")
+        booster.save_model(str(dest))
+        return
+    model.save_model(str(dest))
+
+
+# ===========================================================================
+# STEP 1 — leak-proof CV on the training partition
+# ===========================================================================
+def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     print("\n" + "=" * 78)
-    print("STEP 1  Stratified 5-Fold Cross-Validation (evaluation only)")
+    print("STEP 1  Stratified 5-fold CV on X_train / y_train")
     print("=" * 78)
-    print("Scaler: StandardScaler fit on TRAINING continuous columns of each fold.")
-    print("Imbalance: native class weights / scale_pos_weight — SMOTE is not used.\n")
+    print("Imputer: FaissImputer(n_neighbors=5, strategy='mean') — fit on train fold only.")
+    print("Scaler:  StandardScaler on continuous columns (nunique > 10) — train fold only.")
+    print("Imbalance: scale_pos_weight = n_neg / n_pos on the training fold.")
+    print("OOT is held out of this entire loop.\n")
 
     cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-    mean_fpr = np.linspace(0, 1, N_ROC_POINTS)
     records: list[dict] = []
-    tpr_store = {name: [] for name in MODEL_ORDER}
 
-    for fold, (train_idx, val_idx) in enumerate(cv.split(X, y), start=1):
-        X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    for fold, (tr_idx, va_idx) in enumerate(cv.split(X, y), start=1):
+        X_tr, X_va = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
+        y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        spw = scale_pos_weight(y_tr)
+        print(f"Fold {fold}/{N_SPLITS}  n_train={len(X_tr):,}  n_val={len(X_va):,}  scale_pos_weight={spw:.2f}")
 
-        continuous_cols = identify_continuous_columns(X_train)
-        print(f"Fold {fold}/{N_SPLITS}")
-        print(f"  Continuous columns scaled ({len(continuous_cols)}): {continuous_cols}")
-        print(
-            f"  Left unscaled (binary/low-cardinality): "
-            f"{[c for c in X_train.columns if c not in continuous_cols]}"
-        )
-
-        X_train_s, X_val_s, _ = apply_scaler_to_continuous(X_train, X_val, continuous_cols)
-
-        spw = scale_pos_weight_from_labels(y_train)
-        print(f"  Train n0/n1 scale_pos_weight = {spw:.4f}")
-
+        X_tr_p, X_va_p, *_ = impute_and_scale(X_tr, X_va)
         models = build_models(spw)
         for name in MODEL_ORDER:
-            model = models[name]
             print(f"  Fitting {name} ...", flush=True)
-            model.fit(X_train_s, y_train)
-            y_proba = model.predict_proba(X_val_s)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            metrics = evaluate_fold(y_val, y_pred, y_proba)
-            print(
-                f"    {name:<20} Recall={metrics['recall']:.4f}  "
-                f"AUC-ROC={metrics['auc_roc']:.4f}  F1={metrics['f1']:.4f}"
-            )
+            model = models[name]
+            model.fit(X_tr_p, y_tr)
+            y_proba = model.predict_proba(X_va_p)[:, 1]
+            metrics = evaluate(y_va, y_proba)
+            print_metrics(name, metrics)
             records.append({"stage": "cv", "fold": fold, "model": name, **metrics})
-            tpr_store[name].append(interpolate_tpr(y_val, y_proba, mean_fpr))
         print()
 
     fold_df = pd.DataFrame(records)
-    return fold_df, tpr_store, mean_fpr
+    metric_cols = ["recall", "auc_roc", "auc_pr", "f1", "lift_at_10"]
 
+    print("=" * 78)
+    print("MEAN ± STD across 5 stratified folds  (positive class = Default)")
+    print("=" * 78)
+    header = f"{'Model':<22}" + "".join(f"{m:>16}" for m in metric_cols)
+    print(header)
+    print("-" * len(header))
 
-def write_metrics_benchmark(fold_df: pd.DataFrame) -> pd.DataFrame:
-    """Persist fold-level rows and mean/std summary rows in one CSV."""
-    metric_cols = ["recall", "auc_roc", "f1"]
     summary_rows: list[dict] = []
-
-    print("\n" + "=" * 78)
-    print("MEAN ± STD  |  positive class = Default (MIS_Status = 1)")
-    print("=" * 78)
-    print(f"{'Model':<22} {'Recall':>20} {'AUC-ROC':>20} {'F1-Score':>20}")
-    print("-" * 78)
-
-    for model in MODEL_ORDER:
-        subset = fold_df.loc[fold_df["model"] == model, metric_cols]
-        means = subset.mean()
-        stds = subset.std(ddof=1)
+    for name in MODEL_ORDER:
+        subset = fold_df.loc[fold_df["model"] == name, metric_cols]
+        means, stds = subset.mean(), subset.std(ddof=1)
         print(
-            f"{model:<22} "
-            f"{means['recall']:.4f} ± {stds['recall']:.4f}   "
-            f"{means['auc_roc']:.4f} ± {stds['auc_roc']:.4f}   "
-            f"{means['f1']:.4f} ± {stds['f1']:.4f}"
+            f"{name:<22}"
+            + "".join(f"{means[m]:.4f}±{stds[m]:.4f}".rjust(16) for m in metric_cols)
         )
-        summary_rows.append(
-            {"stage": "cv", "fold": "mean", "model": model, **means.to_dict()}
-        )
-        summary_rows.append(
-            {"stage": "cv", "fold": "std", "model": model, **stds.to_dict()}
-        )
+        summary_rows.append({"stage": "cv", "fold": "mean", "model": name, **means.to_dict()})
+        summary_rows.append({"stage": "cv", "fold": "std", "model": name, **stds.to_dict()})
 
     print("=" * 78)
-    print("Accuracy is omitted as a headline metric (governance Rule 2).")
-    print("These CV estimates are the paper's unbiased performance claims.")
-    print("STEP 2 models are fit on 100% of the data and must not be scored as test metrics.\n")
+    print("Accuracy is omitted as a headline metric (rare-event default).")
+    print("These CV numbers are the in-time performance claims. STEP 3 is OOT.\n")
 
     combined = pd.concat([fold_df, pd.DataFrame(summary_rows)], ignore_index=True)
     out_path = RESULTS_DIR / "metrics_benchmark.csv"
@@ -336,118 +376,109 @@ def write_metrics_benchmark(fold_df: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
-def plot_cv_roc(tpr_store: dict[str, list[np.ndarray]], mean_fpr: np.ndarray) -> Path:
-    out_path = FIGURES_DIR / "roc_curves_comparison.png"
-    plt.figure(figsize=(9, 7))
-    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Chance")
-
-    for name in MODEL_ORDER:
-        tprs = np.vstack(tpr_store[name])
-        mean_tpr = tprs.mean(axis=0)
-        mean_auc = auc(mean_fpr, mean_tpr)
-        std_tpr = tprs.std(axis=0)
-        plt.plot(mean_fpr, mean_tpr, linewidth=2, label=f"{name} (mean AUC={mean_auc:.3f})")
-        plt.fill_between(
-            mean_fpr,
-            np.clip(mean_tpr - std_tpr, 0, 1),
-            np.clip(mean_tpr + std_tpr, 0, 1),
-            alpha=0.12,
-        )
-
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate (Recall)")
-    plt.title("Stratified 5-Fold CV ROC Curves — SME Credit Risk")
-    plt.legend(loc="lower right", fontsize=9)
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Wrote {out_path.relative_to(PROJECT_ROOT)}")
-    return out_path
-
-
-def save_champion_native(name: str, model, dest: Path) -> None:
-    """Write each booster in its native audit format.
-
-    LGBMClassifier (sklearn API) does not expose ``save_model``; the fitted
-    booster does. XGBoost and CatBoost sklearn wrappers do expose it.
-    """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if name == "LightGBM":
-        booster = getattr(model, "booster_", None)
-        if booster is None:
-            raise AttributeError(
-                "LightGBM model has no booster_ after fit; cannot serialize."
-            )
-        booster.save_model(str(dest))
-        return
-    if not hasattr(model, "save_model"):
-        raise AttributeError(f"{type(model).__name__} has no save_model().")
-    model.save_model(str(dest))
-
-
-def run_final_fit(X: pd.DataFrame, y: pd.Series) -> None:
-    """STEP 2: global scaler + champion serialization. Not used for reported metrics."""
+# ===========================================================================
+# STEP 2 — global artifacts on 100% of X_train
+# ===========================================================================
+def run_final_fit(
+    X_train: pd.DataFrame, y_train: pd.Series, X_oot: pd.DataFrame
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     print("\n" + "=" * 78)
-    print("STEP 2  Final fit on 100% of the sample (serialization only)")
+    print("STEP 2  Global imputer / scaler / champion fit on 100% of X_train")
     print("=" * 78)
+    print("OOT is transformed with the frozen train-only artifacts. It is not used to fit them.\n")
 
-    continuous_cols = identify_continuous_columns(X)
-    print(f"Global continuous columns ({len(continuous_cols)}): {continuous_cols}")
+    X_train_p, X_oot_p, imputer, scaler, continuous_cols = impute_and_scale(X_train, X_oot)
 
-    scaler = StandardScaler()
-    if not continuous_cols:
-        raise RuntimeError("Cannot fit a global scaler: no continuous columns found.")
-    scaler.fit(X[continuous_cols])
-
-    X_scaled = X.copy()
-    X_scaled[continuous_cols] = scaler.transform(X[continuous_cols])
-
+    imputer_path = ARTIFACTS_DIR / "imputer.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler.joblib"
+    joblib.dump(imputer, imputer_path)
     joblib.dump(scaler, scaler_path)
-    print(f"Saved global StandardScaler -> {scaler_path.relative_to(PROJECT_ROOT)}")
-    print(f"  scaler.feature_names_in_ = {list(scaler.feature_names_in_)}")
+    print(f"  Saved {imputer_path.relative_to(PROJECT_ROOT)}")
+    print(f"  Saved {scaler_path.relative_to(PROJECT_ROOT)}")
+    print(f"  scaler.feature_names_in_ = {list(getattr(scaler, 'feature_names_in_', continuous_cols))}")
 
-    spw = scale_pos_weight_from_labels(y)
-    print(f"Full-sample scale_pos_weight = {spw:.4f}")
+    spw = scale_pos_weight(y_train)
+    print(f"  Full-train scale_pos_weight = {spw:.2f}")
 
-    champions = {
-        "XGBoost": XGBClassifier(scale_pos_weight=spw, **XGB_BASELINE),
-        "LightGBM": LGBMClassifier(scale_pos_weight=spw, **LGBM_BASELINE),
-        "CatBoost": CatBoostClassifier(auto_class_weights="Balanced", **CATBOOST_BASELINE),
-    }
+    champions = build_models(spw)
     save_paths = {
         "XGBoost": ARTIFACTS_DIR / "xgboost_best.json",
         "CatBoost": ARTIFACTS_DIR / "catboost_best.bin",
         "LightGBM": ARTIFACTS_DIR / "lightgbm_best.txt",
     }
-
-    for name in CHAMPION_MODELS:
-        print(f"Fitting final {name} on all {len(X_scaled):,} rows ...", flush=True)
+    fitted = {}
+    for name in MODEL_ORDER:
+        print(f"  Fitting final {name} on {len(X_train_p):,} training rows ...", flush=True)
         model = champions[name]
-        model.fit(X_scaled, y)
-        dest = save_paths[name]
-        save_champion_native(name, model, dest)
-        print(f"  Serialized {name} -> {dest.relative_to(PROJECT_ROOT)}")
+        model.fit(X_train_p, y_train)
+        save_champion(name, model, save_paths[name])
+        print(f"    Serialized -> {save_paths[name].relative_to(PROJECT_ROOT)}")
+        fitted[name] = model
 
-    print("\nSTEP 2 complete. Downstream SHAP/DoWhy scripts must:")
-    print("  1. Load models/artifacts/scaler.joblib")
-    print("  2. Transform only scaler.feature_names_in_ (continuous columns)")
-    print("  3. Leave one-hot / low-cardinality columns unscaled")
+    return fitted, X_train_p, X_oot_p
+
+
+# ===========================================================================
+# STEP 3 — chronological OOT evaluation
+# ===========================================================================
+def run_oot_evaluation(models: dict, X_oot_p: pd.DataFrame, y_oot: pd.Series) -> pd.DataFrame:
+    print("\n" + "=" * 78)
+    print("STEP 3  Out-of-time evaluation on X_oot / y_oot")
+    print("=" * 78)
+    print("This split is newer than every training row. It is the paper's temporal test.\n")
+
+    records: list[dict] = []
+    proba_store: dict[str, np.ndarray] = {}
+    for name in MODEL_ORDER:
+        print(f"  Scoring {name} on OOT ({len(X_oot_p):,} rows) ...", flush=True)
+        y_proba = models[name].predict_proba(X_oot_p)[:, 1]
+        metrics = evaluate(y_oot, y_proba)
+        print_metrics(f"OOT {name}", metrics)
+        records.append({"stage": "oot", "fold": "oot", "model": name, **metrics})
+        proba_store[name] = y_proba
+
+    oot_df = pd.DataFrame(records)
+    bench_path = RESULTS_DIR / "metrics_benchmark.csv"
+    if bench_path.exists():
+        prior = pd.read_csv(bench_path)
+        pd.concat([prior, oot_df], ignore_index=True).to_csv(bench_path, index=False)
+    else:
+        oot_df.to_csv(bench_path, index=False)
+    print(f"  Appended OOT rows to {bench_path.relative_to(PROJECT_ROOT)}")
+
+    # Headless OOT ROC — one curve per champion.
+    out_path = FIGURES_DIR / "roc_curves_comparison.png"
+    plt.figure(figsize=(9, 7))
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, label="Chance")
+    for name in MODEL_ORDER:
+        fpr, tpr, _ = roc_curve(y_oot, proba_store[name], pos_label=POSITIVE_LABEL)
+        plt.plot(fpr, tpr, linewidth=2, label=f"{name} (AUC={auc(fpr, tpr):.3f})")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate (Recall)")
+    plt.title("Out-of-Time ROC — SME Credit Risk (chronological holdout)")
+    plt.legend(loc="lower right", fontsize=9)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Wrote {out_path.relative_to(PROJECT_ROOT)}")
+    return oot_df
 
 
 def main() -> int:
     os.chdir(PROJECT_ROOT)
-    print("SME Credit Risk — two-step trainer")
+    print("SME Credit Risk — two-step trainer + OOT evaluation")
     print(f"Project root: {PROJECT_ROOT}\n")
     print("Creating output directories if missing:")
-    ensure_output_dirs()
+    ensure_dirs()
 
-    X, y = load_dataset(DATA_PATH)
-    fold_df, tpr_store, mean_fpr = run_cross_validation(X, y)
-    write_metrics_benchmark(fold_df)
-    plot_cv_roc(tpr_store, mean_fpr)
-    run_final_fit(X, y)
+    print("\nLoading chronological splits (NaNs still present):")
+    X_train, y_train = load_xy("train")
+    X_oot, y_oot = load_xy("oot")
+
+    run_cross_validation(X_train, y_train)
+    models, _, X_oot_p = run_final_fit(X_train, y_train, X_oot)
+    run_oot_evaluation(models, X_oot_p, y_oot)
 
     print("\nPipeline finished successfully.")
     return 0
