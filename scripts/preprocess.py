@@ -35,8 +35,8 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 TARGET_COL = "MIS_Status"
 DATE_COL = "ApprovalDate"
 
-# Newest 10% is the OOT holdout; oldest 90% is the modeling sample.
-OOT_FRACTION = 0.1
+# Newest is the OOT holdout; oldest is the modeling sample.
+OOT_FRACTION = 0.15
 UNSEEN_POINTS = 3  # midpoint / "average" quintile for unseen or missing keys
 YEAR_CAP = 2024    # two-digit years parsed into the future are rolled back 100y
 
