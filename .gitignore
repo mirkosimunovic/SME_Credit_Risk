@@ -3,7 +3,6 @@
 
 # Large Datasets (SBA National is ~1M rows; do not commit raw data)
 data/raw/
-data/processed/
 data/docs/
 
 # Python Virtual Environments & Packages
