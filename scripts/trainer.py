@@ -6,12 +6,14 @@ Uses the chronological, un-imputed splits from scripts/preprocess.py:
     data/processed/X_oot.csv,   y_oot.csv
 
 STEP 1 — Stratified 5-fold CV on the training partition only.
-          FastKNNImputer + StandardScaler are fit on the training fold slice
-          and applied to that fold's validation slice. Never fit on OOT.
+          FastKNNImputer only exposes fit_transform (no sklearn fit/transform).
+          Train-fold rows are imputed in isolation; val rows are stacked under
+          that complete reference so neighbors come from train. Never fit on OOT.
           Metrics: Recall, AUC-ROC, AUC-PR, F1, Lift@10%.
 
-STEP 2 — Fit a global imputer and scaler on 100% of X_train, train the
-          three boosting champions, serialize native artifacts.
+STEP 2 — Impute 100% of X_train, persist that complete matrix as the imputer
+          artifact (the fknni object cannot transform new rows). Fit scaler and
+          champions on the imputed/scaled train set; serialize native artifacts.
 
 STEP 3 — Score the chronological OOT holdout with those frozen artifacts
           and write a headless ROC comparison.
@@ -179,6 +181,24 @@ def encode_non_numeric(X_fit: pd.DataFrame, X_apply: pd.DataFrame) -> tuple[pd.D
     return X_tr, X_ap, encodings
 
 
+def encode_with_mapping(
+    X: pd.DataFrame, encodings: dict, feature_columns: list[str]
+) -> pd.DataFrame:
+    """Apply encodings learned on a training slice to a new frame."""
+    out = pd.DataFrame(index=X.index)
+    for col in feature_columns:
+        if col not in X.columns:
+            out[col] = np.nan
+            continue
+        series = X[col]
+        if col in encodings:
+            tokens = series.where(series.notna(), np.nan).astype("string")
+            out[col] = tokens.map(encodings[col]).astype(float)
+        else:
+            out[col] = pd.to_numeric(series, errors="coerce")
+    return out
+
+
 def identify_continuous(frame: pd.DataFrame) -> list[str]:
     """High-cardinality numeric features. Binary / low-card flags stay unscaled."""
     return [
@@ -189,39 +209,110 @@ def identify_continuous(frame: pd.DataFrame) -> list[str]:
 
 
 def make_imputer() -> FastKNNImputer:
-    """fknni FastKNNImputer (current public name; FaissImputer was removed)."""
+    """fknni FastKNNImputer. Only fit_transform exists — do not call fit/transform."""
     return FastKNNImputer(n_neighbors=5, strategy="mean")
+
+
+def _to_numpy(frame: pd.DataFrame) -> np.ndarray:
+    return frame.to_numpy(dtype=np.float64, copy=True)
+
+
+def _knn_fit_transform(X: np.ndarray) -> np.ndarray:
+    """Run FastKNNImputer.fit_transform and coerce CuPy output back to NumPy."""
+    imputed = make_imputer().fit_transform(X)
+    if hasattr(imputed, "get"):
+        imputed = imputed.get()
+    return np.asarray(imputed, dtype=np.float64)
+
+
+def impute_training_slice(X_enc: pd.DataFrame) -> pd.DataFrame:
+    """Impute the training slice in isolation (no validation / OOT rows)."""
+    print(
+        f"    FastKNNImputer.fit_transform on training slice ({len(X_enc):,} rows) ...",
+        flush=True,
+    )
+    arr = _knn_fit_transform(_to_numpy(X_enc))
+    return pd.DataFrame(arr, columns=X_enc.columns, index=X_enc.index)
+
+
+def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) -> pd.DataFrame:
+    """Fill apply-set NaNs using a complete training matrix as the neighbor pool.
+
+    FastKNNImputer cannot transform new rows. We stack the already-imputed
+    reference on top of the encoded apply set and run fit_transform. Reference
+    rows have no NaNs, so they should stay fixed; apply rows borrow neighbors
+    predominantly from that frozen train block.
+    """
+    n_ref = len(X_ref_imp)
+    X_apply_aligned = X_apply_enc.reindex(columns=list(X_ref_imp.columns))
+    stacked = np.vstack([_to_numpy(X_ref_imp), _to_numpy(X_apply_aligned)])
+    print(
+        f"    FastKNNImputer.fit_transform on stacked reference+apply "
+        f"({stacked.shape[0]:,} rows) ...",
+        flush=True,
+    )
+    stacked_imp = _knn_fit_transform(stacked)
+    return pd.DataFrame(
+        stacked_imp[n_ref:],
+        columns=X_ref_imp.columns,
+        index=X_apply_enc.index,
+    )
+
+
+class StackedFastKNNImputer:
+    """Serializable stand-in for FastKNNImputer, which has no transform().
+
+    Stores the complete imputed training matrix plus the train-only encodings.
+    New data is encoded with those maps, stacked under the reference, and
+    imputed with a fresh fit_transform.
+    """
+
+    def __init__(self, n_neighbors: int = 5, strategy: str = "mean"):
+        self.n_neighbors = n_neighbors
+        self.strategy = strategy
+        self.reference_: pd.DataFrame | None = None
+        self.encodings_: dict = {}
+        self.feature_columns_: list[str] = []
+
+    def fit_reference(self, X_fit_enc: pd.DataFrame, encodings: dict) -> pd.DataFrame:
+        self.encodings_ = encodings
+        self.feature_columns_ = list(X_fit_enc.columns)
+        self.reference_ = impute_training_slice(X_fit_enc)
+        return self.reference_
+
+    def transform(self, X_raw: pd.DataFrame) -> pd.DataFrame:
+        if self.reference_ is None:
+            raise RuntimeError("StackedFastKNNImputer has no training reference.")
+        X_enc = encode_with_mapping(X_raw, self.encodings_, self.feature_columns_)
+        return impute_from_reference(self.reference_, X_enc)
+
+    def transform_encoded(self, X_enc: pd.DataFrame) -> pd.DataFrame:
+        if self.reference_ is None:
+            raise RuntimeError("StackedFastKNNImputer has no training reference.")
+        return impute_from_reference(self.reference_, X_enc)
 
 
 def impute_and_scale(
     X_fit: pd.DataFrame,
     X_apply: pd.DataFrame,
-    imputer: FastKNNImputer | None = None,
+    imputer: StackedFastKNNImputer | None = None,
     scaler: StandardScaler | None = None,
     continuous_cols: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, FastKNNImputer, StandardScaler, list[str]]:
-    """Leak-proof numeric prep: encode -> impute -> scale continuous columns.
+) -> tuple[pd.DataFrame, pd.DataFrame, StackedFastKNNImputer, StandardScaler, list[str]]:
+    """Leak-proof numeric prep: encode -> impute train -> impute apply -> scale.
 
-    If imputer/scaler are None, they are fit on X_fit only.
+    FastKNNImputer has no fit/transform, so the wrapper imputes X_fit alone,
+    then imputes X_apply against that complete reference.
     """
-    X_fit_enc, X_apply_enc, _ = encode_non_numeric(X_fit, X_apply)
-    feature_cols = list(X_fit_enc.columns)
+    X_fit_enc, X_apply_enc, encodings = encode_non_numeric(X_fit, X_apply)
 
-    if imputer is None:
-        imputer = make_imputer()
-        print("    Fitting FastKNNImputer on the training slice ...", flush=True)
-        imputer.fit(X_fit_enc)
+    if imputer is None or imputer.reference_ is None:
+        imputer = StackedFastKNNImputer()
+        X_fit_imp = imputer.fit_reference(X_fit_enc, encodings)
+    else:
+        X_fit_imp = imputer.reference_
 
-    X_fit_imp = pd.DataFrame(
-        imputer.transform(X_fit_enc),
-        columns=feature_cols,
-        index=X_fit_enc.index,
-    )
-    X_apply_imp = pd.DataFrame(
-        imputer.transform(X_apply_enc),
-        columns=feature_cols,
-        index=X_apply_enc.index,
-    )
+    X_apply_imp = imputer.transform_encoded(X_apply_enc)
 
     if continuous_cols is None:
         continuous_cols = identify_continuous(X_fit_imp)
@@ -318,7 +409,8 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     print("\n" + "=" * 78)
     print("STEP 1  Stratified 5-fold CV on X_train / y_train")
     print("=" * 78)
-    print("Imputer: FastKNNImputer(n_neighbors=5, strategy='mean') — fit on train fold only.")
+    print("Imputer: FastKNNImputer.fit_transform on the train fold, then on stacked val.")
+    print("         (Library has no fit/transform; val neighbors come from imputed train.)")
     print("Scaler:  StandardScaler on continuous columns (nunique > 10) — train fold only.")
     print("Imbalance: scale_pos_weight = n_neg / n_pos on the training fold.")
     print("OOT is held out of this entire loop.\n")
@@ -385,15 +477,17 @@ def run_final_fit(
     print("\n" + "=" * 78)
     print("STEP 2  Global imputer / scaler / champion fit on 100% of X_train")
     print("=" * 78)
-    print("OOT is transformed with the frozen train-only artifacts. It is not used to fit them.\n")
+    print("OOT is imputed against the frozen imputed-train reference. It is not used to fit it.\n")
 
     X_train_p, X_oot_p, imputer, scaler, continuous_cols = impute_and_scale(X_train, X_oot)
 
     imputer_path = ARTIFACTS_DIR / "imputer.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler.joblib"
+    # FastKNNImputer itself cannot transform new rows. Persist the wrapper that
+    # holds the complete training matrix + encodings (call .transform on new X).
     joblib.dump(imputer, imputer_path)
     joblib.dump(scaler, scaler_path)
-    print(f"  Saved {imputer_path.relative_to(PROJECT_ROOT)}")
+    print(f"  Saved {imputer_path.relative_to(PROJECT_ROOT)}  (StackedFastKNNImputer)")
     print(f"  Saved {scaler_path.relative_to(PROJECT_ROOT)}")
     print(f"  scaler.feature_names_in_ = {list(getattr(scaler, 'feature_names_in_', continuous_cols))}")
 
