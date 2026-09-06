@@ -4,3 +4,9 @@ catboost
 optuna
 shap
 dowhy
+scipy
+scikit-learn
+joblib
+matplotlib
+pandas
+numpy
