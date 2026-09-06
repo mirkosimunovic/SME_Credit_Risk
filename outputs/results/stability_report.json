@@ -1,0 +1,251 @@
+{
+  "champion_model": "models/artifacts/xgboost_best.json",
+  "shap_sample_size": 5000,
+  "shap_sample_default_rate": 0.3028,
+  "seeds": [
+    42,
+    7,
+    13,
+    21,
+    99
+  ],
+  "top_10_features_champion": [
+    "Term",
+    "Guarantee_Ratio",
+    "Term_Years",
+    "RevLineCr",
+    "GrAppv",
+    "UrbanRural",
+    "NAICS",
+    "State_Points",
+    "RetainedJob",
+    "NoEmp"
+  ],
+  "champion_mean_abs_shap": {
+    "Term": 2.063839912414551,
+    "Guarantee_Ratio": 0.47406432032585144,
+    "Term_Years": 0.41960176825523376,
+    "RevLineCr": 0.20008531212806702,
+    "GrAppv": 0.19543004035949707,
+    "UrbanRural": 0.18035149574279785,
+    "NAICS": 0.1672862023115158,
+    "State_Points": 0.15651537477970123,
+    "RetainedJob": 0.15061542391777039,
+    "NoEmp": 0.1073378175497055
+  },
+  "kendall_w": 0.9776969696969697,
+  "kendall_w_formula": "W = 12S / (m^2 (n^3 - n) - m T), n=10 features, m=5 seeds, T=tie correction",
+  "friedman_chi2": 43.99636363636364,
+  "df": 9,
+  "rank_variance_top10": {
+    "Term": 0.0,
+    "Guarantee_Ratio": 0.19999999999999996,
+    "Term_Years": 0.19999999999999996,
+    "RevLineCr": 0.19999999999999998,
+    "GrAppv": 0.30000000000000004,
+    "UrbanRural": 0.8,
+    "NAICS": 0.0,
+    "State_Points": 0.30000000000000004,
+    "RetainedJob": 0.30000000000000004,
+    "NoEmp": 0.0
+  },
+  "mean_rank_top10": {
+    "Term": 1.0,
+    "Guarantee_Ratio": 2.2,
+    "Term_Years": 2.8,
+    "RevLineCr": 4.2,
+    "GrAppv": 5.4,
+    "UrbanRural": 5.4,
+    "NAICS": 7.0,
+    "State_Points": 8.4,
+    "RetainedJob": 8.6,
+    "NoEmp": 10.0
+  },
+  "ranks_within_top10_by_seed": {
+    "42": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    },
+    "7": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 3.0,
+      "Term_Years": 2.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 9.0,
+      "RetainedJob": 8.0,
+      "NoEmp": 10.0
+    },
+    "13": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 9.0,
+      "RetainedJob": 8.0,
+      "NoEmp": 10.0
+    },
+    "21": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 5.0,
+      "GrAppv": 6.0,
+      "UrbanRural": 4.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    },
+    "99": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 6.0,
+      "UrbanRural": 5.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    }
+  },
+  "global_ranks_of_top10_by_seed": {
+    "42": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    },
+    "7": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 3.0,
+      "Term_Years": 2.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 9.0,
+      "RetainedJob": 8.0,
+      "NoEmp": 10.0
+    },
+    "13": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 5.0,
+      "UrbanRural": 6.0,
+      "NAICS": 7.0,
+      "State_Points": 9.0,
+      "RetainedJob": 8.0,
+      "NoEmp": 10.0
+    },
+    "21": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 5.0,
+      "GrAppv": 6.0,
+      "UrbanRural": 4.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    },
+    "99": {
+      "Term": 1.0,
+      "Guarantee_Ratio": 2.0,
+      "Term_Years": 3.0,
+      "RevLineCr": 4.0,
+      "GrAppv": 6.0,
+      "UrbanRural": 5.0,
+      "NAICS": 7.0,
+      "State_Points": 8.0,
+      "RetainedJob": 9.0,
+      "NoEmp": 10.0
+    }
+  },
+  "mean_abs_shap_top10_by_seed": {
+    "42": {
+      "Term": 2.063839912414551,
+      "Guarantee_Ratio": 0.47406432032585144,
+      "Term_Years": 0.41960176825523376,
+      "RevLineCr": 0.20008531212806702,
+      "GrAppv": 0.19543004035949707,
+      "UrbanRural": 0.18035149574279785,
+      "NAICS": 0.1672862023115158,
+      "State_Points": 0.15651537477970123,
+      "RetainedJob": 0.15061542391777039,
+      "NoEmp": 0.1073378175497055
+    },
+    "7": {
+      "Term": 1.9999024868011475,
+      "Guarantee_Ratio": 0.4768426716327667,
+      "Term_Years": 0.4997105896472931,
+      "RevLineCr": 0.19549931585788727,
+      "GrAppv": 0.1884816586971283,
+      "UrbanRural": 0.17388291656970978,
+      "NAICS": 0.16144336760044098,
+      "State_Points": 0.147788405418396,
+      "RetainedJob": 0.1499992311000824,
+      "NoEmp": 0.1152026355266571
+    },
+    "13": {
+      "Term": 2.086606979370117,
+      "Guarantee_Ratio": 0.47669747471809387,
+      "Term_Years": 0.39821091294288635,
+      "RevLineCr": 0.19919028878211975,
+      "GrAppv": 0.1882658302783966,
+      "UrbanRural": 0.1716579645872116,
+      "NAICS": 0.16517113149166107,
+      "State_Points": 0.15017352998256683,
+      "RetainedJob": 0.1554030478000641,
+      "NoEmp": 0.12093034386634827
+    },
+    "21": {
+      "Term": 2.1904685497283936,
+      "Guarantee_Ratio": 0.48373252153396606,
+      "Term_Years": 0.26298123598098755,
+      "RevLineCr": 0.18531641364097595,
+      "GrAppv": 0.176362544298172,
+      "UrbanRural": 0.18616114556789398,
+      "NAICS": 0.16484583914279938,
+      "State_Points": 0.15190880000591278,
+      "RetainedJob": 0.1434905230998993,
+      "NoEmp": 0.11313044279813766
+    },
+    "99": {
+      "Term": 2.1003947257995605,
+      "Guarantee_Ratio": 0.4715018570423126,
+      "Term_Years": 0.3869518041610718,
+      "RevLineCr": 0.20154649019241333,
+      "GrAppv": 0.19804105162620544,
+      "UrbanRural": 0.20022137463092804,
+      "NAICS": 0.15759186446666718,
+      "State_Points": 0.15139371156692505,
+      "RetainedJob": 0.13680404424667358,
+      "NoEmp": 0.11854688823223114
+    }
+  },
+  "interpretation": "W approaching 1.0 indicates stable adverse-action feature ranks across random seeds (EU AI Act / CFPB explanation stability)."
+}
