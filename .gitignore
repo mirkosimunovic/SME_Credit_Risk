@@ -4,7 +4,7 @@
 # Large Datasets (SBA National is ~1M rows; do not commit raw data)
 data/raw/
 data/docs/
-data/processed/
+#data/processed/
 
 models/artifacts/
 
