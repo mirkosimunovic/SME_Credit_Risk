@@ -5,7 +5,7 @@ oldest 95% vs newest 5% (out-of-time), and computes State / NAICS-sector risk
 points from the training split only.
 
 Feature-engineering source columns (Term, GrAppv, NAICS, LowDoc, NewExist,
-FranchiseCode, CreateJob, RetainedJob, State, RevLineCr, ...) are KEPT in
+ CreateJob, RetainedJob, State, RevLineCr, ...) are KEPT in
 their original form. Only identifiers and post-decision leakage columns are
 dropped.
 
@@ -62,6 +62,7 @@ IDENTIFIER_COLS = [
     "Bank",
     "BankState",
     "ApprovalFY",
+    "FranchiseCode",
     DATE_COL,
 ]
 
@@ -281,7 +282,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # These transforms do not use group statistics, so they cannot leak.
     # Original source columns are left in place — trees can still split on
-    # Term months, raw GrAppv, FranchiseCode, job counts, etc.
+    # Term months, raw GrAppv, job counts, etc.
     print("\n[4] Feature engineering on both splits (originals kept)")
     for split_name, frame in (("train", train), ("oot", oot)):
         gr = pd.to_numeric(frame["GrAppv"], errors="coerce")
@@ -330,7 +331,7 @@ def main() -> None:
     # Step 5. Drop leakage and identifiers only
     # -----------------------------------------------------------------------
     # We do NOT drop Term, GrAppv, NAICS, NAICS_Sector, State, LowDoc,
-    # NewExist, FranchiseCode, CreateJob, RetainedJob, RevLineCr, UrbanRural,
+    # NewExist, CreateJob, RetainedJob, RevLineCr, UrbanRural,
     # or NoEmp. Those can still be informative in raw form; CV will impute
     # whatever NaNs remain (e.g. LowDoc, RevLineCr, NewExist).
     print("\n[5] Drop target-leakage and identifier columns")
