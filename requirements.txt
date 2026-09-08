@@ -4,6 +4,7 @@ catboost
 optuna
 shap
 dowhy
+econml
 scipy
 scikit-learn
 joblib
