@@ -94,7 +94,8 @@ def _cuda_available() -> bool:
 
 
 USE_GPU = _cuda_available()
-XGB_TREE_METHOD = "gpu_hist" if USE_GPU else "hist"
+# XGBoost 2+/3: gpu_hist was removed. GPU is tree_method='hist' + device='cuda'.
+XGB_DEVICE = "cuda" if USE_GPU else "cpu"
 LGBM_DEVICE = "gpu" if USE_GPU else "cpu"
 CAT_TASK = "GPU" if USE_GPU else "CPU"
 
@@ -103,7 +104,8 @@ def xgb_fixed(spw: float, seed: int = RANDOM_STATE) -> dict:
     return dict(
         scale_pos_weight=spw,
         eval_metric="logloss",
-        tree_method=XGB_TREE_METHOD,
+        tree_method="hist",
+        device=XGB_DEVICE,
         n_jobs=-1,
         random_state=seed,
         verbosity=0,
@@ -711,7 +713,7 @@ def run_oot_evaluation(models: dict, X_oot_p: pd.DataFrame, y_oot: pd.Series) ->
 def main() -> int:
     os.chdir(PROJECT_ROOT)
     print("SME Credit Risk v2 — tuned trainer + OOT bootstrap CIs")
-    print(f"Project root: {PROJECT_ROOT}  GPU={USE_GPU} ({XGB_TREE_METHOD})\n")
+    print(f"Project root: {PROJECT_ROOT}  GPU={USE_GPU} (xgb device={XGB_DEVICE})\n")
     print("Creating output directories if missing:")
     ensure_dirs()
 
