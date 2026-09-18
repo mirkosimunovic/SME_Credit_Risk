@@ -69,6 +69,18 @@ IDENTIFIER_COLS = [
     DATE_COL,
 ]
 
+# Raw parents / codes replaced by engineered features (VIF > 5 vs derivatives).
+REDUNDANT_PARENT_COLS = [
+    "Term",              # keep Term_Years
+    "NAICS",             # keep NAICS_Sector_Points
+    "NAICS_Sector",      # keep NAICS_Sector_Points
+    "CreateJob",         # keep IsCreateJob
+    "RetainedJob",       # keep IsRetained
+    "GrAppv",            # keep Log_GrAppv
+    "SBA_Appv",          # keep Guarantee_Ratio (also listed in LEAKAGE_COLS)
+    "State",             # keep State_Points
+]
+
 
 # ---------------------------------------------------------------------------
 # Small helpers — used more than once so we do not copy-paste the same logic
@@ -354,15 +366,15 @@ def main() -> None:
         print(f"  Engineered columns added on {split_name}.")
 
     # -----------------------------------------------------------------------
-    # Step 5. Drop leakage and identifiers only
+    # Step 5. Drop leakage, identifiers, and collinear parent columns
     # -----------------------------------------------------------------------
-    # We do NOT drop Term, GrAppv, NAICS, NAICS_Sector, State, LowDoc,
-    # NewExist, CreateJob, RetainedJob, RevLineCr, UrbanRural,
-    # or NoEmp. Those can still be informative in raw form; CV will impute
-    # whatever NaNs remain (e.g. LowDoc, RevLineCr, NewExist).
-    print("\n[5] Drop target-leakage and identifier columns")
-    drop_cols = [c for c in LEAKAGE_COLS + IDENTIFIER_COLS if c in train.columns]
-    print(f"  Dropping: {drop_cols}")
+    print("\n[5] Drop target-leakage, identifier, and redundant parent columns")
+    requested = LEAKAGE_COLS + IDENTIFIER_COLS + REDUNDANT_PARENT_COLS
+    drop_cols = list(dict.fromkeys(c for c in requested if c in train.columns))
+    missing_drops = [c for c in requested if c not in train.columns]
+    print(f"  Dropping ({len(drop_cols)}): {drop_cols}")
+    if missing_drops:
+        print(f"  Already absent (skipped): {missing_drops}")
     train = train.drop(columns=drop_cols)
     oot = oot.drop(columns=drop_cols)
 
