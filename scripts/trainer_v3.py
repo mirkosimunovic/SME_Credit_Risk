@@ -1,13 +1,13 @@
-"""Two-step SME credit-risk trainer v3 (profit-sensitive).
+"""Two-step SME credit-risk trainer v3 (unweighted ROC-AUC baseline).
 
 Uses chronological splits from scripts/preprocess_v3.py:
 
     data/processed/X_train_v3.csv, y_train_v3.csv
     data/processed/X_oot_v3.csv,   y_oot_v3.csv
 
-Tuning objective is balanced_accuracy. Training uses row-level financial
-sample weights (expected credit loss on defaults vs interest opportunity
-cost on performing loans). scale_pos_weight is not used.
+Tuning objective is roc_auc. Champions are fit with unweighted binary
+cross-entropy (no sample_weight, no scale_pos_weight). Financial-weight
+helpers remain as optional post-hoc utilities.
 
 Target: MIS_Status (0 = Paid in Full, 1 = Default).
 """
@@ -449,25 +449,22 @@ def report_vif(X_scaled: pd.DataFrame, continuous_cols: list[str], label: str) -
     return rows
 
 
-def _tune_subsample(
-    X: pd.DataFrame, y: pd.Series, weights: np.ndarray
-) -> tuple[pd.DataFrame, pd.Series, np.ndarray]:
+def _tune_subsample(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     n = min(TUNE_SUBSAMPLE, len(X))
-    w = np.asarray(weights, dtype=float)
     if n == len(X):
-        return X, y, w
-    Xs, _, ys, _, Ws, _ = train_test_split(
-        X, y, w, train_size=n, stratify=y, random_state=RANDOM_STATE
+        return X, y
+    Xs, _, ys, _ = train_test_split(
+        X, y, train_size=n, stratify=y, random_state=RANDOM_STATE
     )
-    return Xs, ys, np.asarray(Ws, dtype=float)
+    return Xs, ys
 
 
-def tune_model(name: str, X: pd.DataFrame, y: pd.Series, weights: np.ndarray) -> dict:
-    """RandomizedSearchCV on balanced_accuracy with financial sample weights."""
-    Xs, ys, Ws = _tune_subsample(X, y, weights)
+def tune_model(name: str, X: pd.DataFrame, y: pd.Series) -> dict:
+    """Unweighted RandomizedSearchCV maximizing ROC-AUC."""
+    Xs, ys = _tune_subsample(X, y)
     print(
         f"    Tuning {name} (n_iter={N_TUNE_ITER}, cv={TUNE_CV}, "
-        f"subsample={len(Xs):,}, gpu={USE_GPU}, scoring=balanced_accuracy) ...",
+        f"subsample={len(Xs):,}, gpu={USE_GPU}, scoring=roc_auc) ...",
         flush=True,
     )
     if name == "XGBoost":
@@ -484,15 +481,15 @@ def tune_model(name: str, X: pd.DataFrame, y: pd.Series, weights: np.ndarray) ->
         grid,
         n_iter=N_TUNE_ITER,
         cv=TUNE_CV,
-        scoring="balanced_accuracy",
+        scoring="roc_auc",
         n_jobs=1,
         random_state=RANDOM_STATE,
         refit=True,
         verbose=0,
     )
-    search.fit(Xs, ys, sample_weight=Ws)
+    search.fit(Xs, ys)
     print(
-        f"    {name} best balanced_accuracy={search.best_score_:.4f}  "
+        f"    {name} best ROC-AUC={search.best_score_:.4f}  "
         f"params={search.best_params_}"
     )
     return dict(search.best_params_)
@@ -547,29 +544,27 @@ def lift_at_fraction(y_true, y_proba, fraction: float = LIFT_FRACTION) -> float:
     return float(y_true[order].mean() / base)
 
 
-def evaluate(y_true, y_proba, X: pd.DataFrame) -> dict[str, float]:
+def evaluate(y_true, y_proba) -> dict[str, float]:
     y_pred = (np.asarray(y_proba) >= 0.5).astype(int)
     return {
-        "recall": float(recall_score(y_true, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "auc_roc": float(roc_auc_score(y_true, y_proba)),
         "auc_pr": float(average_precision_score(y_true, y_proba)),
         "f1": float(f1_score(y_true, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "lift_at_10": lift_at_fraction(y_true, y_proba, LIFT_FRACTION),
-        "expected_portfolio_profit": expected_portfolio_profit(X, y_true, y_pred),
     }
 
 
 def print_metrics(label: str, metrics: dict[str, float]) -> None:
     print(
         f"    {label:<22} "
-        f"Recall={metrics['recall']:.4f}  "
-        f"BalAcc={metrics['balanced_accuracy']:.4f}  "
         f"AUC-ROC={metrics['auc_roc']:.4f}  "
         f"AUC-PR={metrics['auc_pr']:.4f}  "
         f"F1={metrics['f1']:.4f}  "
-        f"Lift@10%={metrics['lift_at_10']:.3f}  "
-        f"E[Profit]={metrics['expected_portfolio_profit']:,.0f}"
+        f"Recall={metrics['recall']:.4f}  "
+        f"BalAcc={metrics['balanced_accuracy']:.4f}  "
+        f"Lift@10%={metrics['lift_at_10']:.3f}"
     )
 
 
@@ -595,8 +590,8 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     print("Imputer: FastKNNImputer.fit_transform on the train fold, then on stacked val.")
     print("         (Library has no fit/transform; val neighbors come from imputed train.)")
     print("Scaler:  StandardScaler on continuous columns (nunique > 10) — train fold only.")
-    print("Weights: financial sample weights on unscaled rows (ECL vs interest opportunity).")
-    print("Tuning:  RandomizedSearchCV scoring=balanced_accuracy. No scale_pos_weight.")
+    print("Fit:     unweighted binary cross-entropy. No sample_weight / scale_pos_weight.")
+    print("Tuning:  RandomizedSearchCV scoring=roc_auc.")
     print("OOT is held out of this entire loop.\n")
 
     cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
@@ -605,35 +600,29 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     for fold, (tr_idx, va_idx) in enumerate(cv.split(X, y), start=1):
         X_tr, X_va = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
-        weights_tr = calculate_financial_weights(X_tr, y_tr)
-        print(
-            f"Fold {fold}/{N_SPLITS}  n_train={len(X_tr):,}  n_val={len(X_va):,}  "
-            f"weight mean={float(weights_tr.mean()):.3f}  "
-            f"weight max={float(weights_tr.max()):.2f}"
-        )
+        print(f"Fold {fold}/{N_SPLITS}  n_train={len(X_tr):,}  n_val={len(X_va):,}")
 
         X_tr_p, X_va_p, _, _, continuous_cols = impute_and_scale(X_tr, X_va)
         report_vif(X_tr_p, continuous_cols, label=f"fold {fold} train")
         for name in MODEL_ORDER:
             print(f"  Fitting {name} ...", flush=True)
-            best = tune_model(name, X_tr_p, y_tr, weights_tr)
+            best = tune_model(name, X_tr_p, y_tr)
             model = instantiate_tuned(name, best)
-            model.fit(X_tr_p, y_tr, sample_weight=weights_tr)
+            model.fit(X_tr_p, y_tr)
             y_proba = model.predict_proba(X_va_p)[:, 1]
-            metrics = evaluate(y_va, y_proba, X_va)
+            metrics = evaluate(y_va, y_proba)
             print_metrics(name, metrics)
             records.append({"stage": "cv", "fold": fold, "model": name, **metrics})
         print()
 
     fold_df = pd.DataFrame(records)
     metric_cols = [
-        "recall",
-        "balanced_accuracy",
         "auc_roc",
         "auc_pr",
         "f1",
+        "recall",
+        "balanced_accuracy",
         "lift_at_10",
-        "expected_portfolio_profit",
     ]
 
     print("=" * 78)
@@ -649,10 +638,7 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         means, stds = subset.mean(), subset.std(ddof=1)
         cells = []
         for m in metric_cols:
-            if m == "expected_portfolio_profit":
-                cells.append(f"{means[m]:,.0f}±{stds[m]:,.0f}".rjust(22))
-            else:
-                cells.append(f"{means[m]:.4f}±{stds[m]:.4f}".rjust(22))
+            cells.append(f"{means[m]:.4f}±{stds[m]:.4f}".rjust(22))
         print(f"{name:<22}" + "".join(cells))
         summary_rows.append({"stage": "cv", "fold": "mean", "model": name, **means.to_dict()})
         summary_rows.append({"stage": "cv", "fold": "std", "model": name, **stds.to_dict()})
@@ -690,12 +676,6 @@ def run_final_fit(
     print(f"  Saved {scaler_path.relative_to(PROJECT_ROOT)}")
     print(f"  scaler.feature_names_in_ = {list(getattr(scaler, 'feature_names_in_', continuous_cols))}")
 
-    weights = calculate_financial_weights(X_train, y_train)
-    print(
-        f"  Full-train financial weights: mean={float(weights.mean()):.3f}  "
-        f"max={float(weights.max()):.2f}  (no scale_pos_weight)"
-    )
-
     best_params: dict[str, dict] = {}
     save_paths = {
         "XGBoost": ARTIFACTS_DIR / "xgboost_best_v3.json",
@@ -705,10 +685,10 @@ def run_final_fit(
     fitted = {}
     for name in MODEL_ORDER:
         print(f"  Tuning + fitting final {name} on {len(X_train_p):,} training rows ...", flush=True)
-        best = tune_model(name, X_train_p, y_train, weights)
+        best = tune_model(name, X_train_p, y_train)
         best_params[name] = best
         model = instantiate_tuned(name, best)
-        model.fit(X_train_p, y_train, sample_weight=weights)
+        model.fit(X_train_p, y_train)
         save_champion(name, model, save_paths[name])
         print(f"    Serialized -> {save_paths[name].relative_to(PROJECT_ROOT)}")
         fitted[name] = model
@@ -718,8 +698,7 @@ def run_final_fit(
         json.dump(
             {
                 "gpu": USE_GPU,
-                "tuning_objective": "balanced_accuracy",
-                "assumed_interest_rate": ASSUMED_INTEREST_RATE,
+                "tuning_objective": "roc_auc",
                 "params": best_params,
             },
             fh,
@@ -745,7 +724,7 @@ def run_oot_evaluation(
     for name in MODEL_ORDER:
         print(f"  Scoring {name} on OOT ({len(X_oot_p):,} rows) ...", flush=True)
         y_proba = models[name].predict_proba(X_oot_p)[:, 1]
-        metrics = evaluate(y_oot, y_proba, X_oot_raw)
+        metrics = evaluate(y_oot, y_proba)
         print_metrics(f"OOT {name}", metrics)
         print(f"    Bootstrap {BOOTSTRAP_ITERS} AUC CIs for {name} ...", flush=True)
         ci = bootstrap_auc_ci(y_oot, y_proba)
@@ -773,7 +752,7 @@ def run_oot_evaluation(
         plt.plot(fpr, tpr, linewidth=2, label=f"{name} (AUC={auc(fpr, tpr):.3f})")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate (Recall)")
-    plt.title("Out-of-Time ROC — SME Credit Risk v3 (profit-sensitive)")
+    plt.title("Out-of-Time ROC — SME Credit Risk v3 (unweighted ROC-AUC)")
     plt.legend(loc="lower right", fontsize=9)
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -785,7 +764,7 @@ def run_oot_evaluation(
 
 def main() -> int:
     os.chdir(PROJECT_ROOT)
-    print("SME Credit Risk v3 — financial weights + balanced_accuracy tuning")
+    print("SME Credit Risk v3 — unweighted ROC-AUC baseline")
     print(f"Project root: {PROJECT_ROOT}  GPU={USE_GPU} (xgb device={XGB_DEVICE})\n")
     print("Creating output directories if missing:")
     ensure_dirs()

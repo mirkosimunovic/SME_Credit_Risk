@@ -1,10 +1,11 @@
-"""OOT policy simulator v3: XGBoost baseline vs naive ML vs LinearDML CATE.
+"""OOT policy simulator v3: unweighted XGBoost vs LinearDML CATE.
 
-Bridges trainer_v3.py (XGBoost champion) and causal_inference_v2.py Model A
-(Term_Years treatment; Guarantee_Ratio as a common cause). Does not run GCM.
+Bridges trainer_v3.py (ROC-AUC XGBoost champion) and causal_inference_v3.py
+Model A (Term_Years treatment; Guarantee_Ratio as a common cause).
 
-Intervention: extend Term_Years by 5 for OOT loans with baseline default
-probability in [0.50, 0.65] (marginal rejections).
+Intervention: extend Term_Years by 5 for ALL baseline-rejected OOT loans
+(P_base >= 0.50). Portfolio value uses discounted economic NPV
+(Xu, Kou, & Ergu 2025 / Stein 2005 parameters).
 """
 
 from __future__ import annotations
@@ -18,6 +19,10 @@ import warnings
 from pathlib import Path
 
 import joblib
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -33,19 +38,24 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 RESULTS_DIR = PROJECT_ROOT / "outputs" / "results"
+FIGURES_DIR = PROJECT_ROOT / "outputs" / "figures"
 ARTIFACTS_DIR = PROJECT_ROOT / "models" / "artifacts"
 
 TARGET = "MIS_Status"
 TREATMENT_TERM = "Term_Years"
 TREATMENT_GUAR = "Guarantee_Ratio"
-INTEREST_RATE = 0.06
 APPROVE_CUT = 0.50
-MARGINAL_LO = 0.50
-MARGINAL_HI = 0.65
 TERM_DELTA = 5.0
 P_CLIP = 1e-5
 BOOTSTRAP_ITERS = 1_000
 RANDOM_STATE = 42
+
+# Xu, Kou, & Ergu (2025) / Stein (2005) NPV parameters
+NET_INTEREST_MARGIN = 0.02
+UNDERWRITING_FEE = 0.005
+WORKOUT_FEE = 0.02
+LGD = 0.35
+RISK_FREE_RATE = 0.04
 
 # Exact Model A confounder list from causal_inference_v2.py.
 CONFOUNDERS = [
@@ -76,6 +86,7 @@ _TUNED_NUISANCE: dict | None = None
 
 def ensure_dirs() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_xy(split: str) -> tuple[pd.DataFrame, pd.Series]:
@@ -231,22 +242,51 @@ def guarantee_ratio(X: pd.DataFrame) -> np.ndarray:
     return np.clip(g, 0.0, 1.0)
 
 
-def expected_value(p, principal, term, guar, rate: float = INTEREST_RATE) -> np.ndarray:
-    """Per-loan EV if originated. Rejected loans should be zeroed by the caller."""
+def expected_value_npv(
+    p: np.ndarray,
+    principal: np.ndarray,
+    term_years: np.ndarray,
+    guarantee_ratio: np.ndarray,
+    net_interest_margin: float = NET_INTEREST_MARGIN,
+    underwriting_fee: float = UNDERWRITING_FEE,
+    workout_fee: float = WORKOUT_FEE,
+    lgd: float = LGD,
+    risk_free_rate: float = RISK_FREE_RATE,
+) -> np.ndarray:
+    """NPV economic profit per originated loan (Xu, Kou, & Ergu 2025).
+
+    EV_i = (1 - p_i) * NPV_performing_i - p_i * NPV_default_loss_i
+    Rejected loans should be zeroed by the caller.
+    """
     p = clip_p(p)
     principal = np.asarray(principal, dtype=float)
-    term = np.asarray(term, dtype=float)
-    guar = np.asarray(guar, dtype=float)
-    interest = principal * rate * term
-    loss = principal * (1.0 - guar)
-    return (1.0 - p) * interest - p * loss
+    term = np.asarray(term_years, dtype=float)
+    guar = np.asarray(guarantee_ratio, dtype=float)
+    term = np.maximum(term, 0.0)
+
+    pv_annuity_factor = np.where(
+        risk_free_rate > 0,
+        (1.0 - (1.0 + risk_free_rate) ** (-term)) / risk_free_rate,
+        term,
+    )
+    npv_performing = principal * (net_interest_margin * pv_annuity_factor + underwriting_fee)
+    unsecured_principal = principal * (1.0 - guar)
+    npv_default_loss = (
+        (unsecured_principal * lgd + principal * workout_fee) / (1.0 + risk_free_rate)
+    ) - (principal * underwriting_fee)
+    return (1.0 - p) * npv_performing - p * npv_default_loss
+
+
+def expected_value(p, principal, term, guar, **kwargs) -> np.ndarray:
+    """Alias used by portfolio scoring — discounted NPV, not nominal rT."""
+    return expected_value_npv(p, principal, term, guar, **kwargs)
 
 
 def portfolio_from_proba(p, principal, term, guar) -> tuple[np.ndarray, np.ndarray]:
-    """Approve if p < 0.50. Returns (approved_mask, per-loan EV with rejects = 0)."""
+    """Approve if p < 0.50. Returns (approved_mask, per-loan NPV EV with rejects = 0)."""
     p = clip_p(p)
     approved = p < APPROVE_CUT
-    ev = expected_value(p, principal, term, guar)
+    ev = expected_value_npv(p, principal, term, guar)
     ev = np.where(approved, ev, 0.0)
     return approved, ev
 
@@ -465,16 +505,16 @@ def main() -> int:
         f"Baseline_Portfolio_Value={baseline_value:,.0f}"
     )
 
-    targeted = (p_base >= MARGINAL_LO) & (p_base <= MARGINAL_HI)
+    targeted = p_base >= APPROVE_CUT
     n_targeted = int(targeted.sum())
     print(
-        f"\n[4] Marginal rejections: {MARGINAL_LO:.2f} <= P <= {MARGINAL_HI:.2f}  "
+        f"\n[4] All baseline-rejected loans: P_base >= {APPROVE_CUT:.2f}  "
         f"n={n_targeted:,}"
     )
     if n_targeted == 0:
         print("  No targeted loans; causal/naive portfolios equal the baseline.")
 
-    print("\n[5] Naive ML policy — XGBoost on Term_Years + 5 (targeted rows only)")
+    print("\n[5] Naive ML policy — XGBoost on Term_Years + 5 (all rejected rows)")
     X_oot_naive = X_oot.copy()
     X_oot_naive.loc[targeted, TREATMENT_TERM] = (
         pd.to_numeric(X_oot_naive.loc[targeted, TREATMENT_TERM], errors="coerce") + TERM_DELTA
@@ -517,24 +557,52 @@ def main() -> int:
     print("\n[6b] Confounded danger zone — naive approve, causal deny")
     dangerous_approvals = (p_naive < APPROVE_CUT) & (p_causal >= APPROVE_CUT)
     n_dangerous = int(dangerous_approvals.sum())
+    p_base_danger = p_base[dangerous_approvals]
     if n_dangerous:
         toxic_principal = float(
             (principal[dangerous_approvals] * (1.0 - guar[dangerous_approvals])).sum()
         )
         ev_dangerous = float(
-            expected_value(
+            expected_value_npv(
                 p_causal[dangerous_approvals],
                 principal[dangerous_approvals],
                 term_causal[dangerous_approvals],
                 guar[dangerous_approvals],
             ).sum()
         )
+        n_severe = int((p_base_danger > 0.70).sum())
+        p_base_dist = {
+            "mean": float(np.mean(p_base_danger)),
+            "median": float(np.median(p_base_danger)),
+            "p10": float(np.percentile(p_base_danger, 10)),
+            "p25": float(np.percentile(p_base_danger, 25)),
+            "p75": float(np.percentile(p_base_danger, 75)),
+            "p90": float(np.percentile(p_base_danger, 90)),
+            "min": float(np.min(p_base_danger)),
+            "max": float(np.max(p_base_danger)),
+            "n_p_base_gt_0_70": n_severe,
+            "share_p_base_gt_0_70": float(n_severe / n_dangerous),
+        }
     else:
         toxic_principal = 0.0
         ev_dangerous = 0.0
+        p_base_dist = {}
+        n_severe = 0
+    npv_loss_avoided = float(-ev_dangerous)
     print(f"  n_dangerous_naive_approvals={n_dangerous:,}")
+    if n_dangerous:
+        print(
+            f"  P_base (danger zone): mean={p_base_dist['mean']:.3f}  "
+            f"median={p_base_dist['median']:.3f}  "
+            f"min={p_base_dist['min']:.3f}  max={p_base_dist['max']:.3f}"
+        )
+        print(
+            f"  P_base > 0.70 (severe confounding): {n_severe:,}  "
+            f"({100.0 * p_base_dist['share_p_base_gt_0_70']:.1f}%)"
+        )
     print(f"  toxic_principal_exposure_avoided={toxic_principal:,.0f}")
-    print(f"  true_ev_of_dangerous_approvals={ev_dangerous:,.0f}")
+    print(f"  true_npv_ev_of_dangerous_approvals={ev_dangerous:,.0f}")
+    print(f"  npv_economic_value_loss_avoided_by_rejecting={npv_loss_avoided:,.0f}")
 
     print(f"\n[7] Bootstrap {BOOTSTRAP_ITERS} OOT resamples of causal − baseline EV")
     boot = bootstrap_uplift(ev_causal, ev_base)
@@ -545,13 +613,44 @@ def main() -> int:
         f"sig@0.05={boot['significant_at_0.05']}"
     )
 
+    fig_path = FIGURES_DIR / "policy_ev_comparison_v3.png"
+    plt.figure(figsize=(8, 5))
+    labels = ["Baseline\nXGBoost", "Naive ML\nTerm+5", "Causal\nLinearDML"]
+    values = [baseline_value, naive_value, causal_value]
+    colors = ["#4C78A8", "#F58518", "#54A24B"]
+    bars = plt.bar(labels, values, color=colors)
+    plt.axhline(0.0, color="gray", linewidth=0.8)
+    plt.ylabel("Portfolio NPV economic profit ($)")
+    plt.title("OOT policy value — all baseline rejects (P ≥ 0.50), NPV EV")
+    for bar, val in zip(bars, values):
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            val,
+            f"{val:,.0f}",
+            ha="center",
+            va="bottom" if val >= 0 else "top",
+            fontsize=8,
+        )
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Wrote {fig_path.relative_to(PROJECT_ROOT)}")
+
     report = {
-        "interest_rate": INTEREST_RATE,
+        "ev_formulation": "Discounted Economic NPV (Xu, Kou, & Ergu 2025)",
+        "targeted_scope": "All baseline-rejected loans (p_base >= 0.50)",
+        "marginal_band": [0.50, 1.00],
         "approval_threshold": APPROVE_CUT,
-        "marginal_band": [MARGINAL_LO, MARGINAL_HI],
         "term_extension_years": TERM_DELTA,
+        "npv_parameters": {
+            "net_interest_margin": NET_INTEREST_MARGIN,
+            "underwriting_fee": UNDERWRITING_FEE,
+            "workout_fee": WORKOUT_FEE,
+            "lgd": LGD,
+            "risk_free_rate": RISK_FREE_RATE,
+        },
         "n_oot": int(len(X_oot)),
-        "n_targeted_marginal": n_targeted,
+        "n_targeted_rejected": n_targeted,
         "n_approved_baseline": int(appr_base.sum()),
         "n_approved_naive": int(appr_naive.sum()),
         "n_approved_causal": int(appr_causal.sum()),
@@ -563,13 +662,15 @@ def main() -> int:
         "Causal_Portfolio_Value": causal_value,
         "Causal_delta_from_baseline": causal_value - baseline_value,
         "n_dangerous_naive_approvals": n_dangerous,
+        "p_base_dangerous_distribution": p_base_dist,
         "toxic_principal_exposure_avoided": toxic_principal,
         "true_ev_of_dangerous_approvals": ev_dangerous,
+        "npv_economic_value_loss_avoided_by_rejecting": npv_loss_avoided,
         "causal_uplift_bootstrap": boot,
         "note": (
-            "Naive ML re-scores Term_Years+5 through XGBoost (confounded). "
-            "Causal adds LinearDML CATE (Delta-P) to baseline XGBoost probabilities. "
-            "EV uses interest on performing originations minus unsecured loss on defaults."
+            "Naive ML re-scores Term_Years+5 through unweighted ROC-AUC XGBoost. "
+            "Causal adds LinearDML ATE/CATE (Delta-P) to baseline probabilities. "
+            "EV is discounted NPV economic profit (Xu, Kou, & Ergu 2025)."
         ),
     }
     out_path = RESULTS_DIR / "policy_simulation_v3.json"

@@ -1,8 +1,8 @@
-"""Week 3 v3 — SHAP + Kendall's W for the profit-sensitive XGBoost champion.
+"""Week 3 v3 — SHAP + Kendall's W for the unweighted ROC-AUC XGBoost champion.
 
 Loads frozen trainer_v3 artifacts (StackedFastKNNImputer + StandardScaler),
-explains a stratified OOT subsample, then retrains XGBoost under 5 seeds with
-financial sample weights (no scale_pos_weight).
+explains a stratified OOT subsample, then retrains XGBoost under 5 seeds
+without sample weights.
 
 Target: MIS_Status (0 = Paid in Full, 1 = Default).
 """
@@ -413,12 +413,7 @@ def main() -> int:
         X_train_imp = imputer.transform(X_train_raw)
         X_train_p = apply_frozen_scaler(X_train_imp, scaler)
 
-    # Unscaled imputed matrix: Log_GrAppv / Term_Years / Guarantee_Ratio in native units.
-    weights = calculate_financial_weights(X_train_imp, y_train)
-    print(
-        f"  financial sample weights: mean={float(weights.mean()):.3f}  "
-        f"max={float(weights.max()):.2f}  (no scale_pos_weight)"
-    )
+    print("  Stability retraining is unweighted (ROC-AUC champion; no sample_weight).")
 
     # -----------------------------------------------------------------------
     # 3. Champion SHAP on a stratified 5,000-row OOT sample
@@ -466,7 +461,7 @@ def main() -> int:
     # -----------------------------------------------------------------------
     print("\n[4] Explanation stability — retrain XGBoost under 5 seeds")
     print(f"  Seeds: {STABILITY_SEEDS}")
-    print("  Hyperparameters match trainer_v3; financial sample_weight; no scale_pos_weight.")
+    print("  Hyperparameters match trainer_v3; unweighted fit; only random_state changes.")
 
     ranks_global = []  # each row: ranks of top_features among ALL features (1 = highest |SHAP|)
     ranks_within = []  # ranks among the top-10 only
@@ -475,7 +470,7 @@ def main() -> int:
     for i, seed in enumerate(STABILITY_SEEDS, start=1):
         print(f"  Computing SHAP for Seed {i}/{len(STABILITY_SEEDS)} (random_state={seed}) ...")
         model = XGBClassifier(random_state=seed, **XGB_BASELINE)
-        model.fit(X_train_p, y_train, sample_weight=weights)
+        model.fit(X_train_p, y_train)
         seed_explainer = shap.TreeExplainer(model)
         seed_shap = shap_matrix(
             seed_explainer.shap_values(X_shap),
@@ -519,8 +514,7 @@ def main() -> int:
     report = {
         "champion_model": str(model_path.relative_to(PROJECT_ROOT)),
         "xgb_hyperparams": dict(XGB_BASELINE),
-        "stability_fit": "sample_weight=financial_weights (no scale_pos_weight)",
-        "assumed_interest_rate": ASSUMED_INTEREST_RATE,
+        "stability_fit": "unweighted (no sample_weight)",
         "shap_sample_size": int(len(X_shap)),
         "shap_sample_default_rate": float(y_shap.mean()),
         "seeds": STABILITY_SEEDS,
