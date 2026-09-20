@@ -363,23 +363,25 @@ def _unwrap_econml(estimate):
 
 
 def cate_term_extension(estimate, W: pd.DataFrame, t0: np.ndarray, t1: np.ndarray) -> np.ndarray:
-    """CATE as Delta-P of default for T1 vs T0 (LinearDML on binary Y)."""
+    """ATE-scaled Delta-P for T1 vs T0 (LinearDML fitted with no effect modifiers).
+
+    Do not pass confounders as X — EconML expects X to match the (empty) fit-time X.
+    """
+    del W  # retained in the signature for call-site compatibility
     t0 = np.asarray(t0, dtype=float).reshape(-1)
     t1 = np.asarray(t1, dtype=float).reshape(-1)
-    W_num = W.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     est = _unwrap_econml(estimate)
     attempts = []
     if hasattr(est, "effect"):
         attempts.extend(
             [
-                lambda: est.effect(W_num, T0=t0, T1=t1),
-                lambda: est.effect(W_num, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
-                lambda: np.ravel(est.effect(W_num)) * (t1 - t0),
-                lambda: np.ravel(est.effect(X=W_num)) * (t1 - t0),
+                lambda: est.effect(X=None, T0=t0, T1=t1),
+                lambda: est.effect(X=None, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
+                lambda: np.ravel(est.effect(X=None)) * (t1 - t0),
             ]
         )
     if hasattr(est, "const_marginal_effect"):
-        attempts.append(lambda: np.ravel(est.const_marginal_effect(W_num)) * (t1 - t0))
+        attempts.append(lambda: np.ravel(est.const_marginal_effect(X=None)) * (t1 - t0))
     last = None
     for fn in attempts:
         try:
@@ -512,6 +514,28 @@ def main() -> int:
         f"delta={causal_value - baseline_value:,.0f}"
     )
 
+    print("\n[6b] Confounded danger zone — naive approve, causal deny")
+    dangerous_approvals = (p_naive < APPROVE_CUT) & (p_causal >= APPROVE_CUT)
+    n_dangerous = int(dangerous_approvals.sum())
+    if n_dangerous:
+        toxic_principal = float(
+            (principal[dangerous_approvals] * (1.0 - guar[dangerous_approvals])).sum()
+        )
+        ev_dangerous = float(
+            expected_value(
+                p_causal[dangerous_approvals],
+                principal[dangerous_approvals],
+                term_causal[dangerous_approvals],
+                guar[dangerous_approvals],
+            ).sum()
+        )
+    else:
+        toxic_principal = 0.0
+        ev_dangerous = 0.0
+    print(f"  n_dangerous_naive_approvals={n_dangerous:,}")
+    print(f"  toxic_principal_exposure_avoided={toxic_principal:,.0f}")
+    print(f"  true_ev_of_dangerous_approvals={ev_dangerous:,.0f}")
+
     print(f"\n[7] Bootstrap {BOOTSTRAP_ITERS} OOT resamples of causal − baseline EV")
     boot = bootstrap_uplift(ev_causal, ev_base)
     print(
@@ -538,6 +562,9 @@ def main() -> int:
         "Naive_delta_from_baseline": naive_value - baseline_value,
         "Causal_Portfolio_Value": causal_value,
         "Causal_delta_from_baseline": causal_value - baseline_value,
+        "n_dangerous_naive_approvals": n_dangerous,
+        "toxic_principal_exposure_avoided": toxic_principal,
+        "true_ev_of_dangerous_approvals": ev_dangerous,
         "causal_uplift_bootstrap": boot,
         "note": (
             "Naive ML re-scores Term_Years+5 through XGBoost (confounded). "
