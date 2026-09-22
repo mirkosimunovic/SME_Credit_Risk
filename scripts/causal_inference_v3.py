@@ -282,11 +282,13 @@ def estimate_dml(df: pd.DataFrame, treatment: str, common_causes: list[str]) -> 
     print(f"\n  --- DML  treatment={treatment}  outcome={TARGET} ---")
     g = identification_graph(treatment, common_causes)
     gml = graph_to_gml(g)
+    confounders = list(common_causes)
     model = CausalModel(
         data=df,
         treatment=treatment,
         outcome=TARGET,
         graph=gml,
+        effect_modifiers=confounders,
     )
     print("  Identifying via backdoor criterion ...")
     estimand = model.identify_effect(proceed_when_unidentifiable=True)
@@ -473,28 +475,24 @@ def main() -> int:
     print("PHASE 2  Double Machine Learning (LinearDML) on full training complete cases")
     print("=" * 78)
     print(
-        "  Identification note: DML Model A treats Guarantee_Ratio as a common cause "
-        "(direct-effect / backdoor), not as a mediator. Model B treats Term_Years as a "
-        "common cause. This matches the requested CausalModel setup; it is a different "
-        "adjustment set than the GCM DAG's Term_Years -> Guarantee_Ratio path."
+        "  Identification note: Guarantee_Ratio is a downstream mediator of Term_Years "
+        "(maturity-linked guarantee caps). Model A omits it from the backdoor set to "
+        "recover the Total Causal Effect of a term-extension policy. Confounders are "
+        "also passed as effect_modifiers so LinearDML estimates HTE (CATE), not a "
+        "constant ATE."
     )
 
     model_a = estimate_dml(
         df,
         treatment=TREATMENT_TERM,
-        common_causes=confounders + [TREATMENT_GUAR],
-    )
-    model_b = estimate_dml(
-        df,
-        treatment=TREATMENT_GUAR,
-        common_causes=confounders + [TREATMENT_TERM],
+        common_causes=confounders,
     )
 
     # ------------------------------------------------------------------
     # Phase 3 — refutation suite
     # ------------------------------------------------------------------
     print("\n" + "=" * 78)
-    print("PHASE 3  Refutation suite (both treatments)")
+    print("PHASE 3  Refutation suite (Term_Years total-effect model)")
     print("=" * 78)
     print("  random_common_cause     -> estimate should stay similar")
     print("  placebo_treatment        -> estimate should collapse toward 0")
@@ -503,12 +501,10 @@ def main() -> int:
 
     print("\n  Model A (Term_Years):")
     refute_a = refute_bundle(model_a["_model"], model_a["_estimand"], model_a["_estimate"])
-    print("\n  Model B (Guarantee_Ratio):")
-    refute_b = refute_bundle(model_b["_model"], model_b["_estimand"], model_b["_estimate"])
 
     report = {
         "target": TARGET,
-        "treatments": [TREATMENT_TERM, TREATMENT_GUAR],
+        "treatments": [TREATMENT_TERM],
         "confounders_requested": CONFOUNDERS,
         "confounders_used": confounders,
         "n_complete_case_train": int(len(df)),
@@ -522,11 +518,9 @@ def main() -> int:
         },
         "phase2_dml": {
             "term_years": json_safe(model_a),
-            "guarantee_ratio": json_safe(model_b),
         },
         "phase3_refutation": {
             "term_years": refute_a,
-            "guarantee_ratio": refute_b,
         },
     }
     out_path = RESULTS_DIR / "causal_stability_report_v3.json"

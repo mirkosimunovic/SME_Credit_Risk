@@ -1,7 +1,7 @@
-"""OOT policy simulator v3: unweighted XGBoost vs LinearDML CATE.
+"""OOT policy simulator v3: calibrated XGBoost vs LinearDML CATE.
 
-Bridges trainer_v3.py (ROC-AUC XGBoost champion) and causal_inference_v3.py
-Model A (Term_Years treatment; Guarantee_Ratio as a common cause).
+Bridges trainer_v3.py (isotonic-calibrated XGBoost) and causal_inference_v3.py
+Model A (Term_Years total effect; Guarantee_Ratio omitted as a mediator).
 
 Intervention: extend Term_Years by 5 for ALL baseline-rejected OOT loans
 (P_base >= 0.50). Portfolio value uses discounted economic NPV
@@ -30,7 +30,6 @@ from dowhy import CausalModel
 from fknni import FastKNNImputer
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
-from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -360,9 +359,9 @@ def complete_case_train(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 
 
 def fit_linear_dml_model_a(df: pd.DataFrame):
-    """Model A: Term_Years treatment; Guarantee_Ratio in the backdoor set."""
+    """Model A: Term_Years total effect. Guarantee_Ratio is a mediator, not a confounder."""
     confounders = [c for c in CONFOUNDERS if c in df.columns]
-    common_causes = confounders + [TREATMENT_GUAR]
+    common_causes = confounders
     tune_nuisance_lgbm(df[common_causes + [TREATMENT_TERM]], df[TARGET])
     gml = graph_to_gml(identification_graph(TREATMENT_TERM, common_causes))
     model = CausalModel(
@@ -370,6 +369,7 @@ def fit_linear_dml_model_a(df: pd.DataFrame):
         treatment=TREATMENT_TERM,
         outcome=TARGET,
         graph=gml,
+        effect_modifiers=confounders,
     )
     estimand = model.identify_effect(proceed_when_unidentifiable=True)
     print("  Fitting LinearDML (Model A: Term_Years; no GCM) ...")
@@ -403,11 +403,7 @@ def _unwrap_econml(estimate):
 
 
 def cate_term_extension(estimate, W: pd.DataFrame, t0: np.ndarray, t1: np.ndarray) -> np.ndarray:
-    """ATE-scaled Delta-P for T1 vs T0 (LinearDML fitted with no effect modifiers).
-
-    Do not pass confounders as X — EconML expects X to match the (empty) fit-time X.
-    """
-    del W  # retained in the signature for call-site compatibility
+    """Loan-level CATE (Delta-P) for T1 vs T0 using LinearDML effect modifiers."""
     t0 = np.asarray(t0, dtype=float).reshape(-1)
     t1 = np.asarray(t1, dtype=float).reshape(-1)
     est = _unwrap_econml(estimate)
@@ -415,13 +411,13 @@ def cate_term_extension(estimate, W: pd.DataFrame, t0: np.ndarray, t1: np.ndarra
     if hasattr(est, "effect"):
         attempts.extend(
             [
-                lambda: est.effect(X=None, T0=t0, T1=t1),
-                lambda: est.effect(X=None, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
-                lambda: np.ravel(est.effect(X=None)) * (t1 - t0),
+                lambda: est.effect(X=W, T0=t0, T1=t1),
+                lambda: est.effect(X=W, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
+                lambda: np.ravel(est.effect(X=W)) * (t1 - t0),
             ]
         )
     if hasattr(est, "const_marginal_effect"):
-        attempts.append(lambda: np.ravel(est.const_marginal_effect(X=None)) * (t1 - t0))
+        attempts.append(lambda: np.ravel(est.const_marginal_effect(X=W)) * (t1 - t0))
     last = None
     for fn in attempts:
         try:
@@ -473,20 +469,19 @@ def main() -> int:
 
     imputer_path = ARTIFACTS_DIR / "imputer_v3.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler_v3.joblib"
-    model_path = ARTIFACTS_DIR / "xgboost_best_v3.json"
+    model_path = ARTIFACTS_DIR / "xgboost_calibrated_v3.joblib"
     for p in (imputer_path, scaler_path, model_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing artifact: {p}. Run scripts/trainer_v3.py first.")
 
-    print("\n[1] Load v3 splits and frozen XGBoost pipeline")
+    print("\n[1] Load v3 splits and frozen calibrated XGBoost pipeline")
     X_train, y_train = load_xy("train")
     X_oot, _y_oot = load_xy("oot")
 
     print(f"  Loading {imputer_path.relative_to(PROJECT_ROOT)}")
     imputer = load_imputer(imputer_path)
     scaler = joblib.load(scaler_path)
-    champion = XGBClassifier()
-    champion.load_model(str(model_path))
+    champion = joblib.load(model_path)
 
     print("\n[2] Fit LinearDML Model A on complete-case X_train_v3")
     dml_df = complete_case_train(X_train, y_train)

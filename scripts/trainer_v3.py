@@ -39,6 +39,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -678,7 +679,6 @@ def run_final_fit(
 
     best_params: dict[str, dict] = {}
     save_paths = {
-        "XGBoost": ARTIFACTS_DIR / "xgboost_best_v3.json",
         "CatBoost": ARTIFACTS_DIR / "catboost_best_v3.bin",
         "LightGBM": ARTIFACTS_DIR / "lightgbm_best_v3.txt",
     }
@@ -687,6 +687,26 @@ def run_final_fit(
         print(f"  Tuning + fitting final {name} on {len(X_train_p):,} training rows ...", flush=True)
         best = tune_model(name, X_train_p, y_train)
         best_params[name] = best
+        if name == "XGBoost":
+            raw_path = ARTIFACTS_DIR / "xgboost_raw_v3.json"
+            cal_path = ARTIFACTS_DIR / "xgboost_calibrated_v3.joblib"
+            # Track A — uncalibrated trees for SHAP / TreeExplainer.
+            raw = instantiate_tuned(name, best)
+            raw.fit(X_train_p, y_train)
+            save_champion(name, raw, raw_path)
+            print(f"    Serialized raw trees -> {raw_path.relative_to(PROJECT_ROOT)}")
+            # Track B — isotonic CV calibration on train folds only (OOT never seen).
+            cal = CalibratedClassifierCV(
+                estimator=instantiate_tuned(name, best),
+                method="isotonic",
+                cv=5,
+            )
+            print("    Fitting CalibratedClassifierCV(method='isotonic', cv=5) ...", flush=True)
+            cal.fit(X_train_p, y_train)
+            joblib.dump(cal, cal_path)
+            print(f"    Serialized calibrated -> {cal_path.relative_to(PROJECT_ROOT)}")
+            fitted[name] = cal
+            continue
         model = instantiate_tuned(name, best)
         model.fit(X_train_p, y_train)
         save_champion(name, model, save_paths[name])

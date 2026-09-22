@@ -374,7 +374,7 @@ def main() -> int:
     load_tuned_xgb_baseline()
     imputer_path = ARTIFACTS_DIR / "imputer_v3.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler_v3.joblib"
-    model_path = ARTIFACTS_DIR / "xgboost_best_v3.json"
+    model_path = ARTIFACTS_DIR / "xgboost_raw_v3.json"
     for p in (imputer_path, scaler_path, model_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing artifact: {p}")
