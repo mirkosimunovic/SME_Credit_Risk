@@ -378,6 +378,7 @@ def fit_linear_dml_model_a(df: pd.DataFrame):
         method_name="backdoor.econml.dml.LinearDML",
         target_units="ate",
         confidence_intervals=False,
+        effect_modifiers=confounders,
         method_params={
             "init_params": {
                 "model_y": lgbm_regressor(),
@@ -394,30 +395,43 @@ def fit_linear_dml_model_a(df: pd.DataFrame):
 
 
 def _unwrap_econml(estimate):
-    est = getattr(estimate, "estimator", estimate)
-    for attr in ("econml_estimator_", "_econml_estimator", "estimator"):
-        inner = getattr(est, attr, None)
-        if inner is not None and hasattr(inner, "effect"):
-            return inner
-    return est
+    for attr in ("_estimator_object", "estimator"):
+        obj = getattr(estimate, attr, None)
+        if obj is None:
+            continue
+        for inner_attr in ("estimator", "econml_estimator_", "_econml_estimator"):
+            inner = getattr(obj, inner_attr, None)
+            if inner is not None and hasattr(inner, "effect"):
+                return inner
+        if hasattr(obj, "effect"):
+            return obj
+    return estimate
 
 
 def cate_term_extension(estimate, W: pd.DataFrame, t0: np.ndarray, t1: np.ndarray) -> np.ndarray:
     """Loan-level CATE (Delta-P) for T1 vs T0 using LinearDML effect modifiers."""
     t0 = np.asarray(t0, dtype=float).reshape(-1)
     t1 = np.asarray(t1, dtype=float).reshape(-1)
+    if isinstance(W, pd.DataFrame):
+        X = W.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    else:
+        X = np.asarray(W, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
     est = _unwrap_econml(estimate)
+    d_x = getattr(est, "_d_x", None)
+    print(f"  LinearDML fitted X dim={d_x}; inference X shape={X.shape}")
     attempts = []
     if hasattr(est, "effect"):
         attempts.extend(
             [
-                lambda: est.effect(X=W, T0=t0, T1=t1),
-                lambda: est.effect(X=W, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
-                lambda: np.ravel(est.effect(X=W)) * (t1 - t0),
+                lambda: est.effect(X=X, T0=t0, T1=t1),
+                lambda: est.effect(X=X, T0=t0.reshape(-1, 1), T1=t1.reshape(-1, 1)),
+                lambda: np.ravel(est.effect(X=X)) * (t1 - t0),
             ]
         )
     if hasattr(est, "const_marginal_effect"):
-        attempts.append(lambda: np.ravel(est.const_marginal_effect(X=W)) * (t1 - t0))
+        attempts.append(lambda: np.ravel(est.const_marginal_effect(X=X)) * (t1 - t0))
     last = None
     for fn in attempts:
         try:

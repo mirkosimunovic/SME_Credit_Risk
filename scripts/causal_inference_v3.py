@@ -300,6 +300,7 @@ def estimate_dml(df: pd.DataFrame, treatment: str, common_causes: list[str]) -> 
         method_name="backdoor.econml.dml.LinearDML",
         target_units="ate",
         confidence_intervals=True,
+        effect_modifiers=confounders,
         method_params={
             "init_params": {
                 "model_y": lgbm_regressor(),
