@@ -6,8 +6,8 @@ Uses chronological splits from scripts/preprocess_v3.py:
     data/processed/X_oot_v3.csv,   y_oot_v3.csv
 
 Tuning objective is roc_auc. Champions are fit with unweighted binary
-cross-entropy (no sample_weight, no scale_pos_weight). Financial-weight
-helpers remain as optional post-hoc utilities.
+cross-entropy (no sample_weight, no scale_pos_weight). The OOT benchmark
+selects a single champion; CatBoost is trained with native categoricals.
 
 Target: MIS_Status (0 = Paid in Full, 1 = Default).
 """
@@ -66,14 +66,17 @@ RANDOM_STATE = 42
 CARDINALITY_THRESHOLD = 10  # nunique > 10 => continuous (scaled); else leave raw
 LIFT_FRACTION = 0.10
 POSITIVE_LABEL = 1
-ASSUMED_INTEREST_RATE = 0.06
+MISSING_CAT = "__MISSING__"
 
 MODEL_ORDER = ["XGBoost", "LightGBM", "CatBoost"]
+CHAMPION_METRIC = "auc_roc"
 N_TUNE_ITER = 12
 TUNE_CV = 2
 TUNE_SUBSAMPLE = 40_000
 BOOTSTRAP_ITERS = 1_000
 VIF_WARN = 5.0
+DEFAULT_RATE_WARN_PP = 0.02
+NATIVE_EXT = {"XGBoost": ".json", "LightGBM": ".txt", "CatBoost": ".bin"}
 
 
 def _cuda_available() -> bool:
@@ -235,8 +238,84 @@ def identify_continuous(frame: pd.DataFrame) -> list[str]:
     return [
         col
         for col in frame.columns
-        if int(frame[col].nunique(dropna=False)) > CARDINALITY_THRESHOLD
+        if int(pd.to_numeric(frame[col], errors="coerce").nunique(dropna=True))
+        > CARDINALITY_THRESHOLD
     ]
+
+
+def identify_categorical_columns(X_fit: pd.DataFrame) -> list[str]:
+    """String leftovers plus low-cardinality columns (CatBoost native cats)."""
+    cats: list[str] = []
+    for col in X_fit.columns:
+        series = X_fit[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            as_num = pd.to_numeric(series, errors="coerce")
+            if float(as_num.notna().mean()) < 0.95:
+                cats.append(col)
+                continue
+            nunique = int(as_num.nunique(dropna=True))
+        else:
+            nunique = int(pd.to_numeric(series, errors="coerce").nunique(dropna=True))
+        if nunique <= CARDINALITY_THRESHOLD:
+            cats.append(col)
+    return cats
+
+
+def _as_cat_tokens(series: pd.Series) -> pd.Series:
+    """Train-fold-safe tokenisation. Numeric cats become integer strings when whole."""
+    if pd.api.types.is_numeric_dtype(series):
+        num = pd.to_numeric(series, errors="coerce")
+        out = pd.Series(pd.NA, index=series.index, dtype="string")
+        ok = num.notna()
+        if ok.any():
+            vals = num.loc[ok].to_numpy(dtype=float)
+            rounded = np.rint(vals)
+            whole = np.isclose(vals, rounded, equal_nan=False)
+            tokens = np.where(whole, rounded.astype(np.int64).astype(str), np.array([f"{v:.6g}" for v in vals]))
+            out.loc[ok] = tokens
+        return out
+    tokens = series.where(series.notna(), np.nan).astype("string").str.strip()
+    return tokens.replace({"": pd.NA, "<NA>": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+
+
+def fit_category_modes(X_fit: pd.DataFrame, cat_cols: list[str]) -> dict[str, str]:
+    """Mode per categorical column, learned on the training slice only."""
+    modes: dict[str, str] = {}
+    for col in cat_cols:
+        tokens = _as_cat_tokens(X_fit[col]).dropna()
+        modes[col] = str(tokens.mode().iloc[0]) if len(tokens) else MISSING_CAT
+    return modes
+
+
+def apply_category_columns(
+    X: pd.DataFrame, cat_cols: list[str], modes: dict[str, str]
+) -> pd.DataFrame:
+    """Fill missing cats with train modes; leave unseen tokens as their own level."""
+    out = pd.DataFrame(index=X.index)
+    for col in cat_cols:
+        if col not in X.columns:
+            out[col] = modes.get(col, MISSING_CAT)
+            continue
+        tokens = _as_cat_tokens(X[col])
+        mode = modes.get(col, MISSING_CAT)
+        out[col] = tokens.fillna(mode).astype(str)
+    return out
+
+
+def prepare_catboost_frame(
+    X_raw: pd.DataFrame,
+    X_numeric: pd.DataFrame,
+    cat_cols: list[str],
+    modes: dict[str, str],
+) -> pd.DataFrame:
+    """Numeric/scaled features plus native string categoricals (mode-imputed)."""
+    out = X_numeric.copy()
+    if not cat_cols:
+        return out
+    cat_frame = apply_category_columns(X_raw.reindex(index=X_numeric.index), cat_cols, modes)
+    for col in cat_cols:
+        out[col] = cat_frame[col].astype(str)
+    return out
 
 
 def make_imputer() -> FastKNNImputer:
@@ -256,32 +335,112 @@ def _knn_fit_transform(X: np.ndarray) -> np.ndarray:
     return np.asarray(imputed, dtype=np.float64)
 
 
-def impute_training_slice(X_enc: pd.DataFrame) -> pd.DataFrame:
+def _knn_scale_stats(X: pd.DataFrame, continuous_cols: list[str]) -> dict:
+    """Train-only mean/std for the KNN distance metric (NaNs ignored)."""
+    stats: dict = {"cols": list(continuous_cols), "mean": {}, "scale": {}}
+    for col in continuous_cols:
+        if col not in X.columns:
+            continue
+        s = pd.to_numeric(X[col], errors="coerce")
+        mu = float(s.mean())
+        sd = float(s.std(ddof=0))
+        stats["mean"][col] = 0.0 if not np.isfinite(mu) else mu
+        stats["scale"][col] = 1.0 if (not np.isfinite(sd) or sd < 1e-12) else sd
+    return stats
+
+
+def _apply_knn_scale(X: pd.DataFrame, stats: dict | None, invert: bool = False) -> pd.DataFrame:
+    if not stats or not stats.get("cols"):
+        return X.copy()
+    out = X.copy()
+    for col in stats["cols"]:
+        if col not in out.columns:
+            continue
+        mu = float(stats["mean"][col])
+        sd = float(stats["scale"][col])
+        vals = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        out[col] = vals * sd + mu if invert else (vals - mu) / sd
+    return out
+
+
+def _print_knn_imputation_audit(X_before: pd.DataFrame, X_after: pd.DataFrame, continuous_cols: list[str]) -> dict:
+    n = len(X_before)
+    missing = X_before.isna().sum()
+    rows = []
+    print("    KNN imputation audit (continuous columns, raw units after invert):")
+    for col in continuous_cols:
+        n_miss = int(missing.get(col, 0))
+        rate = n_miss / n if n else 0.0
+        rec = {"column": col, "n_missing": n_miss, "missing_rate": rate}
+        rows.append(rec)
+        print(f"      {col:<24} missing={n_miss:,}  rate={rate:.4%}")
+    audit = {"n_rows": int(n), "columns": rows}
+    if not continuous_cols or missing.reindex(continuous_cols).fillna(0).sum() == 0:
+        print("      No missing continuous cells; scaled KNN distance has no fill to compare.")
+        return audit
+    most = str(missing.reindex(continuous_cols).fillna(0).idxmax())
+    mask = X_before[most].isna()
+    observed = pd.to_numeric(X_before.loc[~mask, most], errors="coerce").dropna()
+    imputed = pd.to_numeric(X_after.loc[mask, most], errors="coerce").dropna()
+    print(f"    Sanity check — most-missing continuous column: {most}")
+    if len(observed) and len(imputed):
+        print(
+            f"      observed n={len(observed):,} mean={float(observed.mean()):.4f} "
+            f"median={float(observed.median()):.4f}"
+        )
+        print(
+            f"      imputed  n={len(imputed):,} mean={float(imputed.mean()):.4f} "
+            f"median={float(imputed.median()):.4f}"
+        )
+        audit["sanity_column"] = most
+        audit["observed_mean"] = float(observed.mean())
+        audit["observed_median"] = float(observed.median())
+        audit["imputed_mean"] = float(imputed.mean())
+        audit["imputed_median"] = float(imputed.median())
+        audit["n_imputed"] = int(len(imputed))
+    return audit
+
+
+def impute_training_slice(
+    X_enc: pd.DataFrame, knn_stats: dict | None = None, audit: bool = False
+) -> pd.DataFrame:
     """Impute the training slice in isolation (no validation / OOT rows)."""
     print(
         f"    FastKNNImputer.fit_transform on training slice ({len(X_enc):,} rows) ...",
         flush=True,
     )
-    arr = _knn_fit_transform(_to_numpy(X_enc))
-    return pd.DataFrame(arr, columns=X_enc.columns, index=X_enc.index)
+    Xs = _apply_knn_scale(X_enc, knn_stats, invert=False)
+    arr = _knn_fit_transform(_to_numpy(Xs))
+    imputed = pd.DataFrame(arr, columns=X_enc.columns, index=X_enc.index)
+    imputed = _apply_knn_scale(imputed, knn_stats, invert=True)
+    if audit and knn_stats:
+        _print_knn_imputation_audit(X_enc, imputed, list(knn_stats.get("cols", [])))
+    return imputed
 
 
-def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) -> pd.DataFrame:
+def impute_from_reference(
+    X_ref_imp: pd.DataFrame,
+    X_apply_enc: pd.DataFrame,
+    knn_stats: dict | None = None,
+) -> pd.DataFrame:
     """Fill apply-set NaNs using a complete training matrix as the neighbor pool."""
     n_ref = len(X_ref_imp)
     X_apply_aligned = X_apply_enc.reindex(columns=list(X_ref_imp.columns))
-    stacked = np.vstack([_to_numpy(X_ref_imp), _to_numpy(X_apply_aligned)])
+    ref_s = _apply_knn_scale(X_ref_imp, knn_stats, invert=False)
+    apply_s = _apply_knn_scale(X_apply_aligned, knn_stats, invert=False)
+    stacked = np.vstack([_to_numpy(ref_s), _to_numpy(apply_s)])
     print(
         f"    FastKNNImputer.fit_transform on stacked reference+apply "
         f"({stacked.shape[0]:,} rows) ...",
         flush=True,
     )
     stacked_imp = _knn_fit_transform(stacked)
-    return pd.DataFrame(
+    apply_imp = pd.DataFrame(
         stacked_imp[n_ref:],
         columns=X_ref_imp.columns,
         index=X_apply_enc.index,
     )
+    return _apply_knn_scale(apply_imp, knn_stats, invert=True)
 
 
 class StackedFastKNNImputer:
@@ -293,23 +452,35 @@ class StackedFastKNNImputer:
         self.reference_: pd.DataFrame | None = None
         self.encodings_: dict = {}
         self.feature_columns_: list[str] = []
+        self.knn_scale_stats_: dict | None = None
+        self.cat_columns_: list[str] = []
+        self.cat_modes_: dict[str, str] = {}
 
-    def fit_reference(self, X_fit_enc: pd.DataFrame, encodings: dict) -> pd.DataFrame:
+    def fit_reference(
+        self,
+        X_fit_enc: pd.DataFrame,
+        encodings: dict,
+        audit: bool = False,
+    ) -> pd.DataFrame:
         self.encodings_ = encodings
         self.feature_columns_ = list(X_fit_enc.columns)
-        self.reference_ = impute_training_slice(X_fit_enc)
+        continuous = identify_continuous(X_fit_enc)
+        self.knn_scale_stats_ = _knn_scale_stats(X_fit_enc, continuous)
+        self.reference_ = impute_training_slice(
+            X_fit_enc, self.knn_scale_stats_, audit=audit
+        )
         return self.reference_
 
     def transform(self, X_raw: pd.DataFrame) -> pd.DataFrame:
         if self.reference_ is None:
             raise RuntimeError("StackedFastKNNImputer has no training reference.")
         X_enc = encode_with_mapping(X_raw, self.encodings_, self.feature_columns_)
-        return impute_from_reference(self.reference_, X_enc)
+        return impute_from_reference(self.reference_, X_enc, self.knn_scale_stats_)
 
     def transform_encoded(self, X_enc: pd.DataFrame) -> pd.DataFrame:
         if self.reference_ is None:
             raise RuntimeError("StackedFastKNNImputer has no training reference.")
-        return impute_from_reference(self.reference_, X_enc)
+        return impute_from_reference(self.reference_, X_enc, self.knn_scale_stats_)
 
 
 def impute_and_scale(
@@ -318,13 +489,14 @@ def impute_and_scale(
     imputer: StackedFastKNNImputer | None = None,
     scaler: StandardScaler | None = None,
     continuous_cols: list[str] | None = None,
+    audit: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, StackedFastKNNImputer, StandardScaler, list[str]]:
-    """Leak-proof numeric prep: encode -> impute train -> impute apply -> scale."""
+    """Leak-proof numeric prep: encode -> scaled-KNN impute train -> impute apply -> scale."""
     X_fit_enc, X_apply_enc, encodings = encode_non_numeric(X_fit, X_apply)
 
     if imputer is None or imputer.reference_ is None:
         imputer = StackedFastKNNImputer()
-        X_fit_imp = imputer.fit_reference(X_fit_enc, encodings)
+        X_fit_imp = imputer.fit_reference(X_fit_enc, encodings, audit=audit)
     else:
         X_fit_imp = imputer.reference_
 
@@ -345,89 +517,6 @@ def impute_and_scale(
         X_fit_out[continuous_cols] = scaler.transform(X_fit_imp[continuous_cols])
         X_apply_out[continuous_cols] = scaler.transform(X_apply_imp[continuous_cols])
     return X_fit_out, X_apply_out, imputer, scaler, continuous_cols
-
-
-def _principal_amount(X: pd.DataFrame) -> np.ndarray:
-    """Gross approval in dollars. preprocess_v3 drops GrAppv; invert log1p if needed."""
-    if "GrAppv" in X.columns:
-        g = pd.to_numeric(X["GrAppv"], errors="coerce").to_numpy(dtype=float)
-    elif "Log_GrAppv" in X.columns:
-        logg = pd.to_numeric(X["Log_GrAppv"], errors="coerce").to_numpy(dtype=float)
-        g = np.expm1(logg)
-    else:
-        raise KeyError("Need GrAppv or Log_GrAppv to compute financial weights.")
-    return np.where(np.isfinite(g) & (g > 0), g, np.nan)
-
-
-def _term_years(X: pd.DataFrame) -> np.ndarray:
-    if "Term_Years" not in X.columns:
-        return np.full(len(X), np.nan)
-    t = pd.to_numeric(X["Term_Years"], errors="coerce").to_numpy(dtype=float)
-    return np.where(np.isfinite(t) & (t > 0), t, np.nan)
-
-
-def _guarantee_ratio(X: pd.DataFrame) -> np.ndarray:
-    if "Guarantee_Ratio" not in X.columns:
-        return np.zeros(len(X), dtype=float)
-    g = pd.to_numeric(X["Guarantee_Ratio"], errors="coerce").to_numpy(dtype=float)
-    g = np.where(np.isfinite(g), g, 0.0)
-    return np.clip(g, 0.0, 1.0)
-
-
-def loan_cashflows(
-    X: pd.DataFrame, assumed_interest_rate: float = ASSUMED_INTEREST_RATE
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-loan opportunity profit (performing) and unsecured loss (default)."""
-    principal = _principal_amount(X)
-    term = _term_years(X)
-    guar = _guarantee_ratio(X)
-    profit = principal * assumed_interest_rate * term
-    loss = principal * (1.0 - guar)
-    profit = np.where(np.isfinite(profit) & (profit >= 0), profit, np.nan)
-    loss = np.where(np.isfinite(loss) & (loss >= 0), loss, np.nan)
-    return profit, loss
-
-
-def calculate_financial_weights(
-    X: pd.DataFrame, y: pd.Series, assumed_interest_rate: float = ASSUMED_INTEREST_RATE
-) -> np.ndarray:
-    """Asymmetric cost weights, mean-normalized to 1.0.
-
-    Default (y=1): un-guaranteed principal GrAppv * (1 - Guarantee_Ratio).
-    Paid-in-full (y=0): forgone interest GrAppv * rate * Term_Years.
-    Must be called on *unscaled* features (dollar units, not z-scores).
-    """
-    y_arr = np.asarray(y, dtype=int)
-    profit, loss = loan_cashflows(X, assumed_interest_rate)
-    raw = np.where(y_arr == 1, loss, profit)
-    raw = np.where(np.isfinite(raw) & (raw > 0), raw, np.nan)
-    raw = np.where(np.isnan(raw), 1.0, raw)
-    mean = float(np.mean(raw))
-    if not np.isfinite(mean) or mean <= 0:
-        return np.ones(len(y_arr), dtype=float)
-    return (raw / mean).astype(float)
-
-
-def expected_portfolio_profit(
-    X: pd.DataFrame,
-    y_true,
-    y_pred,
-    assumed_interest_rate: float = ASSUMED_INTEREST_RATE,
-) -> float:
-    """P&L of originated loans (predicted PIF) at a 0.5 cutoff.
-
-    TN: collect assumed interest. FN: lose un-guaranteed principal.
-    Denied loans (predicted default) contribute 0.
-    """
-    y_true = np.asarray(y_true, dtype=int)
-    y_pred = np.asarray(y_pred, dtype=int)
-    profit, loss = loan_cashflows(X, assumed_interest_rate)
-    profit = np.nan_to_num(profit, nan=0.0)
-    loss = np.nan_to_num(loss, nan=0.0)
-    originated = y_pred == 0
-    tn = originated & (y_true == 0)
-    fn = originated & (y_true == 1)
-    return float(profit[tn].sum() - loss[fn].sum())
 
 
 def report_vif(X_scaled: pd.DataFrame, continuous_cols: list[str], label: str) -> list[dict]:
@@ -460,7 +549,7 @@ def _tune_subsample(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Ser
     return Xs, ys
 
 
-def tune_model(name: str, X: pd.DataFrame, y: pd.Series) -> dict:
+def tune_model(name: str, X: pd.DataFrame, y: pd.Series, cat_features: list[str] | None = None) -> dict:
     """Unweighted RandomizedSearchCV maximizing ROC-AUC."""
     Xs, ys = _tune_subsample(X, y)
     print(
@@ -475,7 +564,10 @@ def tune_model(name: str, X: pd.DataFrame, y: pd.Series) -> dict:
         est = LGBMClassifier(**lgbm_fixed())
         grid = LGBM_SEARCH
     else:
-        est = CatBoostClassifier(**cat_fixed())
+        kwargs = dict(cat_fixed())
+        if cat_features:
+            kwargs["cat_features"] = list(cat_features)
+        est = CatBoostClassifier(**kwargs)
         grid = CAT_SEARCH
     search = RandomizedSearchCV(
         est,
@@ -496,12 +588,20 @@ def tune_model(name: str, X: pd.DataFrame, y: pd.Series) -> dict:
     return dict(search.best_params_)
 
 
-def instantiate_tuned(name: str, params: dict, seed: int = RANDOM_STATE):
+def instantiate_tuned(
+    name: str,
+    params: dict,
+    seed: int = RANDOM_STATE,
+    cat_features: list[str] | None = None,
+):
     if name == "XGBoost":
         return XGBClassifier(**xgb_fixed(seed), **params)
     if name == "LightGBM":
         return LGBMClassifier(**lgbm_fixed(seed), **params)
-    return CatBoostClassifier(**cat_fixed(seed), **params)
+    kwargs = dict(cat_fixed(seed))
+    if cat_features:
+        kwargs["cat_features"] = list(cat_features)
+    return CatBoostClassifier(**{**kwargs, **params})
 
 
 def bootstrap_auc_ci(
@@ -581,6 +681,97 @@ def save_champion(name: str, model, dest: Path) -> None:
     model.save_model(str(dest))
 
 
+def _model_frame(name: str, X_raw: pd.DataFrame, X_num: pd.DataFrame, cat_cols, cat_modes):
+    if name == "CatBoost":
+        return prepare_catboost_frame(X_raw, X_num, cat_cols, cat_modes)
+    return X_num
+
+
+def select_champion(bench_path: Path, metric: str = CHAMPION_METRIC) -> tuple[str, pd.DataFrame]:
+    """Pick the best model on OOT `metric`, falling back to CV-mean if OOT is absent."""
+    if not bench_path.exists():
+        raise FileNotFoundError(f"Missing benchmark CSV: {bench_path}")
+    df = pd.read_csv(bench_path)
+    if metric not in df.columns:
+        raise KeyError(f"{bench_path.name} has no column '{metric}'.")
+    oot = df[(df["stage"].astype(str) == "oot") & (df["fold"].astype(str) == "oot")].copy()
+    if len(oot):
+        table = oot
+        source = "OOT"
+    else:
+        table = df[(df["stage"].astype(str) == "cv") & (df["fold"].astype(str) == "mean")].copy()
+        source = "CV-mean"
+        if table.empty:
+            raise ValueError(f"No OOT or CV-mean rows in {bench_path.name}.")
+    table = table.drop_duplicates(subset=["model"], keep="last")
+    table = table.sort_values(metric, ascending=False)
+    winner = str(table.iloc[0]["model"])
+    win_score = float(table.iloc[0][metric])
+    runner_up = str(table.iloc[1]["model"]) if len(table) > 1 else None
+    margin = float(win_score - float(table.iloc[1][metric])) if runner_up else float("nan")
+    print("\n" + "=" * 78)
+    print(f"CHAMPION SELECTION  source={source}  metric={metric}")
+    print("=" * 78)
+    show_cols = [c for c in ["model", "auc_roc", "auc_pr", "f1", "recall", "balanced_accuracy"] if c in table.columns]
+    print(table[show_cols].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    extra = f"  margin vs {runner_up} = {margin:+.4f}" if runner_up else ""
+    print(f"  Winner: {winner}  {metric}={win_score:.4f}{extra}")
+    return winner, table
+
+
+def export_champion_artifacts(
+    winner: str,
+    fitted: dict,
+    train_frames: dict[str, pd.DataFrame],
+    y_train: pd.Series,
+    best_params: dict[str, dict],
+    comparison: pd.DataFrame,
+    cat_cols: list[str],
+) -> dict:
+    """Write model-agnostic raw + calibrated champion files plus metadata."""
+    raw_model = fitted[winner]
+    ext = NATIVE_EXT[winner]
+    raw_path = ARTIFACTS_DIR / f"champion_raw_v3{ext}"
+    cal_path = ARTIFACTS_DIR / "champion_calibrated_v3.joblib"
+    meta_path = ARTIFACTS_DIR / "champion_metadata_v3.json"
+    save_champion(winner, raw_model, raw_path)
+    X_train_m = train_frames[winner]
+    cats = list(cat_cols) if winner == "CatBoost" else None
+    print(f"  Fitting CalibratedClassifierCV on champion={winner} (train only, cv=5) ...")
+    cal = CalibratedClassifierCV(
+        estimator=instantiate_tuned(winner, best_params[winner], cat_features=cats),
+        method="isotonic",
+        cv=5,
+    )
+    cal.fit(X_train_m, y_train)
+    joblib.dump(cal, cal_path)
+    ranked = comparison.sort_values(CHAMPION_METRIC, ascending=False)
+    win_score = float(ranked.iloc[0][CHAMPION_METRIC])
+    runner = None
+    margin = None
+    if len(ranked) > 1:
+        runner = str(ranked.iloc[1]["model"])
+        margin = float(win_score - float(ranked.iloc[1][CHAMPION_METRIC]))
+    meta = {
+        "model": winner,
+        "champion_metric": CHAMPION_METRIC,
+        "champion_metric_value": win_score,
+        "runner_up": runner,
+        "margin_over_runner_up": margin,
+        "raw_path": str(raw_path.relative_to(PROJECT_ROOT)),
+        "calibrated_path": str(cal_path.relative_to(PROJECT_ROOT)),
+        "native_format": ext.lstrip("."),
+        "cat_features": list(cat_cols) if winner == "CatBoost" else [],
+        "comparison": ranked[["model", CHAMPION_METRIC]].to_dict(orient="records"),
+    }
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"  Saved {raw_path.relative_to(PROJECT_ROOT)}")
+    print(f"  Saved {cal_path.relative_to(PROJECT_ROOT)}")
+    print(f"  Saved {meta_path.relative_to(PROJECT_ROOT)}")
+    return meta
+
+
 # ===========================================================================
 # STEP 1 — leak-proof CV on the training partition
 # ===========================================================================
@@ -604,13 +795,19 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         print(f"Fold {fold}/{N_SPLITS}  n_train={len(X_tr):,}  n_val={len(X_va):,}")
 
         X_tr_p, X_va_p, _, _, continuous_cols = impute_and_scale(X_tr, X_va)
+        cat_cols = identify_categorical_columns(X_tr)
+        cat_modes = fit_category_modes(X_tr, cat_cols)
+        print(f"    CatBoost cat_features ({len(cat_cols)}): {cat_cols}")
         report_vif(X_tr_p, continuous_cols, label=f"fold {fold} train")
         for name in MODEL_ORDER:
             print(f"  Fitting {name} ...", flush=True)
-            best = tune_model(name, X_tr_p, y_tr)
-            model = instantiate_tuned(name, best)
-            model.fit(X_tr_p, y_tr)
-            y_proba = model.predict_proba(X_va_p)[:, 1]
+            X_tr_m = _model_frame(name, X_tr, X_tr_p, cat_cols, cat_modes)
+            X_va_m = _model_frame(name, X_va, X_va_p, cat_cols, cat_modes)
+            cats = cat_cols if name == "CatBoost" else None
+            best = tune_model(name, X_tr_m, y_tr, cat_features=cats)
+            model = instantiate_tuned(name, best, cat_features=cats)
+            model.fit(X_tr_m, y_tr)
+            y_proba = model.predict_proba(X_va_m)[:, 1]
             metrics = evaluate(y_va, y_proba)
             print_metrics(name, metrics)
             records.append({"stage": "cv", "fold": fold, "model": name, **metrics})
@@ -660,13 +857,20 @@ def run_cross_validation(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 # ===========================================================================
 def run_final_fit(
     X_train: pd.DataFrame, y_train: pd.Series, X_oot: pd.DataFrame
-) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict, dict, dict, dict, list[str]]:
     print("\n" + "=" * 78)
     print("STEP 2  Global imputer / scaler / champion fit on 100% of X_train")
     print("=" * 78)
     print("OOT is imputed against the frozen imputed-train reference. It is not used to fit it.\n")
 
-    X_train_p, X_oot_p, imputer, scaler, continuous_cols = impute_and_scale(X_train, X_oot)
+    X_train_p, X_oot_p, imputer, scaler, continuous_cols = impute_and_scale(
+        X_train, X_oot, audit=True
+    )
+    cat_cols = identify_categorical_columns(X_train)
+    cat_modes = fit_category_modes(X_train, cat_cols)
+    imputer.cat_columns_ = list(cat_cols)
+    imputer.cat_modes_ = dict(cat_modes)
+    print(f"  CatBoost cat_features ({len(cat_cols)}): {cat_cols}")
     report_vif(X_train_p, continuous_cols, label="final train")
 
     imputer_path = ARTIFACTS_DIR / "imputer_v3.joblib"
@@ -677,38 +881,23 @@ def run_final_fit(
     print(f"  Saved {scaler_path.relative_to(PROJECT_ROOT)}")
     print(f"  scaler.feature_names_in_ = {list(getattr(scaler, 'feature_names_in_', continuous_cols))}")
 
+    train_frames = {name: _model_frame(name, X_train, X_train_p, cat_cols, cat_modes) for name in MODEL_ORDER}
+    oot_frames = {name: _model_frame(name, X_oot, X_oot_p, cat_cols, cat_modes) for name in MODEL_ORDER}
+
     best_params: dict[str, dict] = {}
     save_paths = {
+        "XGBoost": ARTIFACTS_DIR / "xgboost_best_v3.json",
         "CatBoost": ARTIFACTS_DIR / "catboost_best_v3.bin",
         "LightGBM": ARTIFACTS_DIR / "lightgbm_best_v3.txt",
     }
     fitted = {}
     for name in MODEL_ORDER:
-        print(f"  Tuning + fitting final {name} on {len(X_train_p):,} training rows ...", flush=True)
-        best = tune_model(name, X_train_p, y_train)
+        print(f"  Tuning + fitting final {name} on {len(train_frames[name]):,} training rows ...", flush=True)
+        cats = cat_cols if name == "CatBoost" else None
+        best = tune_model(name, train_frames[name], y_train, cat_features=cats)
         best_params[name] = best
-        if name == "XGBoost":
-            raw_path = ARTIFACTS_DIR / "xgboost_raw_v3.json"
-            cal_path = ARTIFACTS_DIR / "xgboost_calibrated_v3.joblib"
-            # Track A — uncalibrated trees for SHAP / TreeExplainer.
-            raw = instantiate_tuned(name, best)
-            raw.fit(X_train_p, y_train)
-            save_champion(name, raw, raw_path)
-            print(f"    Serialized raw trees -> {raw_path.relative_to(PROJECT_ROOT)}")
-            # Track B — isotonic CV calibration on train folds only (OOT never seen).
-            cal = CalibratedClassifierCV(
-                estimator=instantiate_tuned(name, best),
-                method="isotonic",
-                cv=5,
-            )
-            print("    Fitting CalibratedClassifierCV(method='isotonic', cv=5) ...", flush=True)
-            cal.fit(X_train_p, y_train)
-            joblib.dump(cal, cal_path)
-            print(f"    Serialized calibrated -> {cal_path.relative_to(PROJECT_ROOT)}")
-            fitted[name] = cal
-            continue
-        model = instantiate_tuned(name, best)
-        model.fit(X_train_p, y_train)
+        model = instantiate_tuned(name, best, cat_features=cats)
+        model.fit(train_frames[name], y_train)
         save_champion(name, model, save_paths[name])
         print(f"    Serialized -> {save_paths[name].relative_to(PROJECT_ROOT)}")
         fitted[name] = model
@@ -719,20 +908,22 @@ def run_final_fit(
             {
                 "gpu": USE_GPU,
                 "tuning_objective": "roc_auc",
+                "champion_metric": CHAMPION_METRIC,
+                "cat_features": cat_cols,
                 "params": best_params,
             },
             fh,
             indent=2,
         )
     print(f"  Saved {hp_path.relative_to(PROJECT_ROOT)}")
-    return fitted, X_train_p, X_oot_p
+    return fitted, train_frames, oot_frames, best_params, cat_cols
 
 
 # ===========================================================================
 # STEP 3 — chronological OOT evaluation
 # ===========================================================================
 def run_oot_evaluation(
-    models: dict, X_oot_p: pd.DataFrame, y_oot: pd.Series, X_oot_raw: pd.DataFrame
+    models: dict, oot_frames: dict[str, pd.DataFrame], y_oot: pd.Series
 ) -> pd.DataFrame:
     print("\n" + "=" * 78)
     print("STEP 3  Out-of-time evaluation on X_oot / y_oot")
@@ -742,8 +933,9 @@ def run_oot_evaluation(
     records: list[dict] = []
     proba_store: dict[str, np.ndarray] = {}
     for name in MODEL_ORDER:
-        print(f"  Scoring {name} on OOT ({len(X_oot_p):,} rows) ...", flush=True)
-        y_proba = models[name].predict_proba(X_oot_p)[:, 1]
+        X_oot_m = oot_frames[name]
+        print(f"  Scoring {name} on OOT ({len(X_oot_m):,} rows) ...", flush=True)
+        y_proba = models[name].predict_proba(X_oot_m)[:, 1]
         metrics = evaluate(y_oot, y_proba)
         print_metrics(f"OOT {name}", metrics)
         print(f"    Bootstrap {BOOTSTRAP_ITERS} AUC CIs for {name} ...", flush=True)
@@ -794,8 +986,14 @@ def main() -> int:
     X_oot, y_oot = load_xy("oot")
 
     run_cross_validation(X_train, y_train)
-    models, _, X_oot_p = run_final_fit(X_train, y_train, X_oot)
-    run_oot_evaluation(models, X_oot_p, y_oot, X_oot)
+    models, train_frames, oot_frames, best_params, cat_cols = run_final_fit(
+        X_train, y_train, X_oot
+    )
+    run_oot_evaluation(models, oot_frames, y_oot)
+    winner, comparison = select_champion(RESULTS_DIR / "metrics_benchmark_v3.csv")
+    export_champion_artifacts(
+        winner, models, train_frames, y_train, best_params, comparison, cat_cols
+    )
 
     print("\nPipeline finished successfully.")
     return 0

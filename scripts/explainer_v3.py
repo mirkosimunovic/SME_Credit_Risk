@@ -1,8 +1,8 @@
-"""Week 3 v3 — SHAP + Kendall's W for the unweighted ROC-AUC XGBoost champion.
+"""Week 3 v3 — SHAP + Kendall's W for the unweighted ROC-AUC champion.
 
 Loads frozen trainer_v3 artifacts (StackedFastKNNImputer + StandardScaler),
-explains a stratified OOT subsample, then retrains XGBoost under 5 seeds
-without sample weights.
+explains a stratified OOT subsample, then retrains the selected champion
+under 5 seeds without sample weights.
 
 Target: MIS_Status (0 = Paid in Full, 1 = Default).
 """
@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 import shap
 from sklearn.model_selection import train_test_split
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -46,22 +48,7 @@ SHAP_SAMPLE_SIZE = 5_000
 CARDINALITY_THRESHOLD = 10
 STABILITY_SEEDS = [42, 7, 13, 21, 99]
 TOP_K = 10
-ASSUMED_INTEREST_RATE = 0.06
-
-# Populated from outputs/results/best_hyperparams_v3.json (trainer_v3 final XGBoost).
-XGB_BASELINE: dict = {
-    "n_estimators": 300,
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 1,
-    "reg_lambda": 1.0,
-    "tree_method": "hist",
-    "eval_metric": "logloss",
-    "n_jobs": -1,
-    "verbosity": 0,
-}
+MISSING_CAT = "__MISSING__"
 
 
 # ===========================================================================
@@ -91,13 +78,19 @@ def encode_with_mapping(
     return out
 
 
-def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) -> pd.DataFrame:
+def impute_from_reference(
+    X_ref_imp: pd.DataFrame,
+    X_apply_enc: pd.DataFrame,
+    knn_stats: dict | None = None,
+) -> pd.DataFrame:
     """Fill new-row NaNs using the frozen complete training matrix as neighbors."""
     from fknni import FastKNNImputer
 
     n_ref = len(X_ref_imp)
     X_apply_aligned = X_apply_enc.reindex(columns=list(X_ref_imp.columns))
-    stacked = np.vstack([_to_numpy(X_ref_imp), _to_numpy(X_apply_aligned)])
+    ref_s = _apply_knn_scale(X_ref_imp, knn_stats, invert=False)
+    apply_s = _apply_knn_scale(X_apply_aligned, knn_stats, invert=False)
+    stacked = np.vstack([_to_numpy(ref_s), _to_numpy(apply_s)])
     print(
         f"    FastKNNImputer.fit_transform on stacked reference+apply "
         f"({stacked.shape[0]:,} rows) ...",
@@ -107,11 +100,63 @@ def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) ->
     if hasattr(imputed, "get"):
         imputed = imputed.get()
     stacked_imp = np.asarray(imputed, dtype=np.float64)
-    return pd.DataFrame(
+    apply_imp = pd.DataFrame(
         stacked_imp[n_ref:],
         columns=X_ref_imp.columns,
         index=X_apply_enc.index,
     )
+    return _apply_knn_scale(apply_imp, knn_stats, invert=True)
+
+
+def _apply_knn_scale(X: pd.DataFrame, stats: dict | None, invert: bool = False) -> pd.DataFrame:
+    if not stats or not stats.get("cols"):
+        return X.copy()
+    out = X.copy()
+    for col in stats["cols"]:
+        if col not in out.columns:
+            continue
+        mu = float(stats["mean"][col])
+        sd = float(stats["scale"][col])
+        vals = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        out[col] = vals * sd + mu if invert else (vals - mu) / sd
+    return out
+
+
+def _as_cat_tokens(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        num = pd.to_numeric(series, errors="coerce")
+        out = pd.Series(pd.NA, index=series.index, dtype="string")
+        ok = num.notna()
+        if ok.any():
+            vals = num.loc[ok].to_numpy(dtype=float)
+            rounded = np.rint(vals)
+            whole = np.isclose(vals, rounded, equal_nan=False)
+            tokens = np.where(whole, rounded.astype(np.int64).astype(str), np.array([f"{v:.6g}" for v in vals]))
+            out.loc[ok] = tokens
+        return out
+    tokens = series.where(series.notna(), np.nan).astype("string").str.strip()
+    return tokens.replace({"": pd.NA, "<NA>": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+
+
+def apply_category_columns(X: pd.DataFrame, cat_cols: list[str], modes: dict[str, str]) -> pd.DataFrame:
+    out = pd.DataFrame(index=X.index)
+    for col in cat_cols:
+        if col not in X.columns:
+            out[col] = modes.get(col, MISSING_CAT)
+            continue
+        tokens = _as_cat_tokens(X[col])
+        out[col] = tokens.fillna(modes.get(col, MISSING_CAT)).astype(str)
+    return out
+
+
+def prepare_catboost_frame(X_raw, X_numeric, cat_cols, modes) -> pd.DataFrame:
+    out = X_numeric.copy()
+    if not cat_cols:
+        return out
+    cat_frame = apply_category_columns(X_raw.reindex(index=X_numeric.index), cat_cols, modes)
+    for col in cat_cols:
+        out[col] = cat_frame[col].astype(str)
+    return out
 
 
 class StackedFastKNNImputer:
@@ -121,6 +166,9 @@ class StackedFastKNNImputer:
         self.reference_: pd.DataFrame | None = None
         self.encodings_: dict = {}
         self.feature_columns_: list[str] = []
+        self.knn_scale_stats_: dict | None = None
+        self.cat_columns_: list[str] = []
+        self.cat_modes_: dict = {}
 
     def fit_reference(self, X_fit_enc, encodings):
         # Training already happened in trainer_v3.py. The pickled object carries
@@ -133,12 +181,12 @@ class StackedFastKNNImputer:
         if self.reference_ is None:
             raise RuntimeError("StackedFastKNNImputer has no training reference.")
         X_enc = encode_with_mapping(X_raw, self.encodings_, self.feature_columns_)
-        return impute_from_reference(self.reference_, X_enc)
+        return impute_from_reference(self.reference_, X_enc, getattr(self, "knn_scale_stats_", None))
 
     def transform_encoded(self, X_enc):
         if self.reference_ is None:
             raise RuntimeError("StackedFastKNNImputer has no training reference.")
-        return impute_from_reference(self.reference_, X_enc)
+        return impute_from_reference(self.reference_, X_enc, getattr(self, "knn_scale_stats_", None))
 
 
 def _register_imputer_for_unpickle() -> None:
@@ -176,8 +224,19 @@ def load_imputer(path: Path) -> StackedFastKNNImputer:
 # ===========================================================================
 # Helpers
 # ===========================================================================
-def load_tuned_xgb_baseline() -> dict:
-    """Replace XGB_BASELINE with trainer_v3's final RandomizedSearchCV champion params."""
+def load_champion_metadata() -> dict:
+    meta_path = ARTIFACTS_DIR / "champion_metadata_v3.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            "Missing models/artifacts/champion_metadata_v3.json. Run scripts/trainer_v3.py first."
+        )
+    with open(meta_path, encoding="utf-8") as fh:
+        meta = json.load(fh)
+    print(f"  Champion metadata: model={meta.get('model')}  metric={meta.get('champion_metric')}")
+    return meta
+
+
+def load_tuned_params(model_name: str) -> dict:
     hp_path = RESULTS_DIR / "best_hyperparams_v3.json"
     if not hp_path.exists():
         raise FileNotFoundError(
@@ -185,18 +244,53 @@ def load_tuned_xgb_baseline() -> dict:
         )
     with open(hp_path, encoding="utf-8") as fh:
         payload = json.load(fh)
-    params = payload.get("params", {}).get("XGBoost")
+    params = payload.get("params", {}).get(model_name)
     if not isinstance(params, dict) or not params:
-        raise KeyError("best_hyperparams_v3.json has no params.XGBoost block.")
-    merged = dict(XGB_BASELINE)
-    merged.update(params)
-    merged.pop("random_state", None)
-    merged.pop("scale_pos_weight", None)
-    XGB_BASELINE.clear()
-    XGB_BASELINE.update(merged)
-    print(f"  Loaded tuned XGBoost params from {hp_path.relative_to(PROJECT_ROOT)}")
-    print(f"  XGB_BASELINE = {dict(XGB_BASELINE)}")
-    return dict(XGB_BASELINE)
+        raise KeyError(f"best_hyperparams_v3.json has no params.{model_name} block.")
+    params = dict(params)
+    params.pop("random_state", None)
+    params.pop("scale_pos_weight", None)
+    print(f"  Loaded tuned {model_name} params from {hp_path.relative_to(PROJECT_ROOT)}")
+    return params
+
+
+def instantiate_stability_model(name: str, params: dict, seed: int, cat_features: list[str] | None):
+    if name == "XGBoost":
+        return XGBClassifier(
+            random_state=seed,
+            eval_metric="logloss",
+            tree_method="hist",
+            n_jobs=-1,
+            verbosity=0,
+            **params,
+        )
+    if name == "LightGBM":
+        return LGBMClassifier(random_state=seed, verbosity=-1, n_jobs=-1, **params)
+    kwargs = dict(params)
+    if cat_features:
+        kwargs["cat_features"] = list(cat_features)
+    return CatBoostClassifier(
+        random_seed=seed, verbose=False, allow_writing_files=False, **kwargs
+    )
+
+
+def load_raw_champion(meta: dict):
+    name = str(meta["model"])
+    path = PROJECT_ROOT / meta["raw_path"]
+    if not path.exists():
+        raise FileNotFoundError(f"Missing champion raw artifact: {path}")
+    print(f"  Loading raw champion {path.relative_to(PROJECT_ROOT)} ({name})")
+    if name == "XGBoost":
+        model = XGBClassifier()
+        model.load_model(str(path))
+        return model
+    if name == "LightGBM":
+        import lightgbm as lgb
+
+        return lgb.Booster(model_file=str(path))
+    model = CatBoostClassifier()
+    model.load_model(str(path))
+    return model
 
 
 def load_xy(split: str) -> tuple[pd.DataFrame, pd.Series]:
@@ -227,67 +321,6 @@ def apply_frozen_scaler(X_imp: pd.DataFrame, scaler) -> pd.DataFrame:
     if cols:
         X_out[cols] = scaler.transform(X_out[cols])
     return X_out
-
-
-def _principal_amount(X: pd.DataFrame) -> np.ndarray:
-    """Gross approval in dollars. preprocess_v3 drops GrAppv; invert log1p if needed."""
-    if "GrAppv" in X.columns:
-        g = pd.to_numeric(X["GrAppv"], errors="coerce").to_numpy(dtype=float)
-    elif "Log_GrAppv" in X.columns:
-        logg = pd.to_numeric(X["Log_GrAppv"], errors="coerce").to_numpy(dtype=float)
-        g = np.expm1(logg)
-    else:
-        raise KeyError("Need GrAppv or Log_GrAppv to compute financial weights.")
-    return np.where(np.isfinite(g) & (g > 0), g, np.nan)
-
-
-def _term_years(X: pd.DataFrame) -> np.ndarray:
-    if "Term_Years" not in X.columns:
-        return np.full(len(X), np.nan)
-    t = pd.to_numeric(X["Term_Years"], errors="coerce").to_numpy(dtype=float)
-    return np.where(np.isfinite(t) & (t > 0), t, np.nan)
-
-
-def _guarantee_ratio(X: pd.DataFrame) -> np.ndarray:
-    if "Guarantee_Ratio" not in X.columns:
-        return np.zeros(len(X), dtype=float)
-    g = pd.to_numeric(X["Guarantee_Ratio"], errors="coerce").to_numpy(dtype=float)
-    g = np.where(np.isfinite(g), g, 0.0)
-    return np.clip(g, 0.0, 1.0)
-
-
-def loan_cashflows(
-    X: pd.DataFrame, assumed_interest_rate: float = ASSUMED_INTEREST_RATE
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-loan opportunity profit (performing) and unsecured loss (default)."""
-    principal = _principal_amount(X)
-    term = _term_years(X)
-    guar = _guarantee_ratio(X)
-    profit = principal * assumed_interest_rate * term
-    loss = principal * (1.0 - guar)
-    profit = np.where(np.isfinite(profit) & (profit >= 0), profit, np.nan)
-    loss = np.where(np.isfinite(loss) & (loss >= 0), loss, np.nan)
-    return profit, loss
-
-
-def calculate_financial_weights(
-    X: pd.DataFrame, y: pd.Series, assumed_interest_rate: float = ASSUMED_INTEREST_RATE
-) -> np.ndarray:
-    """Asymmetric cost weights, mean-normalized to 1.0.
-
-    Default (y=1): un-guaranteed principal GrAppv * (1 - Guarantee_Ratio).
-    Paid-in-full (y=0): forgone interest GrAppv * rate * Term_Years.
-    Must be called on *unscaled* features (dollar units, not z-scores).
-    """
-    y_arr = np.asarray(y, dtype=int)
-    profit, loss = loan_cashflows(X, assumed_interest_rate)
-    raw = np.where(y_arr == 1, loss, profit)
-    raw = np.where(np.isfinite(raw) & (raw > 0), raw, np.nan)
-    raw = np.where(np.isnan(raw), 1.0, raw)
-    mean = float(np.mean(raw))
-    if not np.isfinite(mean) or mean <= 0:
-        return np.ones(len(y_arr), dtype=float)
-    return (raw / mean).astype(float)
 
 
 def shap_matrix(shap_out, n_rows: int, n_features: int) -> np.ndarray:
@@ -364,18 +397,21 @@ def main() -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 78)
-    print("Week 3 v3  SHAP + Kendall's W (profit-sensitive XGBoost)")
+    print("Week 3 v3  SHAP + Kendall's W (ROC-AUC champion)")
     print("=" * 78)
 
     # -----------------------------------------------------------------------
     # 2. Load frozen assets and transform OOT (and train) consistently
     # -----------------------------------------------------------------------
     print("\n[2] Loading frozen imputer / scaler and chronological splits")
-    load_tuned_xgb_baseline()
+    meta = load_champion_metadata()
+    model_name = str(meta["model"])
+    tuned_params = load_tuned_params(model_name)
+    cat_features = list(meta.get("cat_features") or [])
     imputer_path = ARTIFACTS_DIR / "imputer_v3.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler_v3.joblib"
-    model_path = ARTIFACTS_DIR / "xgboost_raw_v3.json"
-    for p in (imputer_path, scaler_path, model_path):
+    raw_path = PROJECT_ROOT / meta["raw_path"]
+    for p in (imputer_path, scaler_path, raw_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing artifact: {p}")
 
@@ -387,6 +423,8 @@ def main() -> int:
     )
     print(f"  Loading {scaler_path.relative_to(PROJECT_ROOT)} ...")
     scaler = joblib.load(scaler_path)
+    cat_cols = list(getattr(imputer, "cat_columns_", None) or cat_features)
+    cat_modes = dict(getattr(imputer, "cat_modes_", None) or {})
 
     print("  Loading OOT features / targets ...")
     X_oot_raw, y_oot = load_xy("oot")
@@ -396,9 +434,6 @@ def main() -> int:
 
     print("  Loading training features / targets ...")
     X_train_raw, y_train = load_xy("train")
-    # reference_ is the imputed training matrix the champions were fit on.
-    # Re-transforming X_train would stack train on itself (~2x FAISS cost) for
-    # the same neighbor pool. We scale that frozen matrix instead.
     print("  Using imputer.reference_ as imputed X_train (champion training matrix) ...")
     X_train_imp = imputer.reference_.copy()
     if list(X_train_imp.columns) != list(X_oot_p.columns):
@@ -413,6 +448,12 @@ def main() -> int:
         X_train_imp = imputer.transform(X_train_raw)
         X_train_p = apply_frozen_scaler(X_train_imp, scaler)
 
+    if model_name == "CatBoost":
+        X_oot_m = prepare_catboost_frame(X_oot_raw, X_oot_p, cat_cols, cat_modes)
+        X_train_m = prepare_catboost_frame(X_train_raw, X_train_p, cat_cols, cat_modes)
+    else:
+        X_oot_m, X_train_m = X_oot_p, X_train_p
+
     print("  Stability retraining is unweighted (ROC-AUC champion; no sample_weight).")
 
     # -----------------------------------------------------------------------
@@ -420,12 +461,10 @@ def main() -> int:
     # -----------------------------------------------------------------------
     print("\n[3] Champion SHAP (beeswarm + mean-|SHAP| bar) on stratified OOT sample")
     print(f"  Drawing stratified sample of {SHAP_SAMPLE_SIZE:,} OOT rows ...")
-    X_shap, y_shap = stratified_oot_sample(X_oot_p, y_oot, SHAP_SAMPLE_SIZE, seed=42)
+    X_shap, y_shap = stratified_oot_sample(X_oot_m, y_oot, SHAP_SAMPLE_SIZE, seed=42)
     print(f"  Sample shape={X_shap.shape}  sample default rate={float(y_shap.mean()):.6f}")
 
-    print(f"  Loading champion {model_path.relative_to(PROJECT_ROOT)} ...")
-    champion = XGBClassifier()
-    champion.load_model(str(model_path))
+    champion = load_raw_champion(meta)
 
     print("  Initializing shap.TreeExplainer on the champion ...")
     explainer = shap.TreeExplainer(champion)
@@ -459,7 +498,8 @@ def main() -> int:
     # -----------------------------------------------------------------------
     # 4. Stability: 5 seeds, same OOT sample, Kendall's W on top-10 ranks
     # -----------------------------------------------------------------------
-    print("\n[4] Explanation stability — retrain XGBoost under 5 seeds")
+    print("\n[4] Explanation stability — retrain champion under 5 seeds")
+    print(f"  Algorithm: {model_name}")
     print(f"  Seeds: {STABILITY_SEEDS}")
     print("  Hyperparameters match trainer_v3; unweighted fit; only random_state changes.")
 
@@ -469,8 +509,10 @@ def main() -> int:
 
     for i, seed in enumerate(STABILITY_SEEDS, start=1):
         print(f"  Computing SHAP for Seed {i}/{len(STABILITY_SEEDS)} (random_state={seed}) ...")
-        model = XGBClassifier(random_state=seed, **XGB_BASELINE)
-        model.fit(X_train_p, y_train)
+        model = instantiate_stability_model(
+            model_name, tuned_params, seed, cat_cols if model_name == "CatBoost" else None
+        )
+        model.fit(X_train_m, y_train)
         seed_explainer = shap.TreeExplainer(model)
         seed_shap = shap_matrix(
             seed_explainer.shap_values(X_shap),
@@ -512,8 +554,9 @@ def main() -> int:
     }
 
     report = {
-        "champion_model": str(model_path.relative_to(PROJECT_ROOT)),
-        "xgb_hyperparams": dict(XGB_BASELINE),
+        "champion_model": meta.get("raw_path"),
+        "champion_algorithm": model_name,
+        "champion_hyperparams": dict(tuned_params),
         "stability_fit": "unweighted (no sample_weight)",
         "shap_sample_size": int(len(X_shap)),
         "shap_sample_default_rate": float(y_shap.mean()),

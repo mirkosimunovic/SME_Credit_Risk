@@ -26,6 +26,7 @@ from dowhy.gcm.falsify import FalsifyConst, apply_suggestions, falsify_graph
 from dowhy.gcm.independence_test.generalised_cov_measure import generalised_cov_based
 from dowhy.gcm.ml import SklearnRegressionModel
 from lightgbm import LGBMRegressor
+from scipy.stats import chi2_contingency, ks_2samp, norm
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -109,6 +110,103 @@ def analysis_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     if len(out) < 500:
         raise ValueError("Too few complete-case rows to run GCM / DML.")
     return out
+
+
+def check_complete_case_representativeness(
+    df_raw: pd.DataFrame,
+    df_complete: pd.DataFrame,
+    cols: list[str],
+    target: str,
+    alpha: float = ALPHA,
+    default_rate_warn_pp: float = 0.02,
+) -> dict:
+    """Diagnostic: is the complete-case DML sample still like the full train table?"""
+    print("\n" + "=" * 78)
+    print("Complete-case representativeness (diagnostic — does not abort)")
+    print("=" * 78)
+
+    raw_y = pd.to_numeric(df_raw[target], errors="coerce").dropna().astype(int)
+    cc_y = pd.to_numeric(df_complete[target], errors="coerce").dropna().astype(int)
+    p_raw = float(raw_y.mean())
+    p_cc = float(cc_y.mean())
+    delta_pp = p_cc - p_raw
+    count = np.array([int(raw_y.sum()), int(cc_y.sum())])
+    nobs = np.array([int(len(raw_y)), int(len(cc_y))])
+    pooled = float((count[0] + count[1]) / (nobs[0] + nobs[1]))
+    se = float(np.sqrt(pooled * (1.0 - pooled) * (1.0 / nobs[0] + 1.0 / nobs[1])))
+    z_stat = float((p_raw - p_cc) / se) if se > 0 else float("nan")
+    p_z = float(2.0 * norm.sf(abs(z_stat))) if np.isfinite(z_stat) else float("nan")
+    table = np.array(
+        [
+            [int(raw_y.sum()), int((raw_y == 0).sum())],
+            [int(cc_y.sum()), int((cc_y == 0).sum())],
+        ]
+    )
+    try:
+        chi2, p_chi, _, _ = chi2_contingency(table)
+        chi2, p_chi = float(chi2), float(p_chi)
+    except Exception:
+        chi2, p_chi = float("nan"), float("nan")
+
+    print(
+        f"  Default rate  full={p_raw:.4f}  complete-case={p_cc:.4f}  "
+        f"delta={delta_pp:+.4f} ({delta_pp * 100:+.2f} pp)"
+    )
+    print(f"  Two-proportion z={z_stat:.3f}  p={p_z:.4g}  |  chi-square={chi2:.3f}  p={p_chi:.4g}")
+
+    ks_rows = []
+    n_sig = 0
+    print(f"  {'column':<24} {'KS':>10} {'p-value':>12}  flag")
+    for col in cols:
+        if col == target:
+            continue
+        a = pd.to_numeric(df_raw[col], errors="coerce").dropna()
+        b = pd.to_numeric(df_complete[col], errors="coerce").dropna()
+        if len(a) < 10 or len(b) < 10:
+            rec = {"column": col, "ks_stat": None, "p_value": None, "significant": False, "note": "too few"}
+            ks_rows.append(rec)
+            print(f"  {col:<24} {'n/a':>10} {'n/a':>12}  skipped")
+            continue
+        stat, pval = ks_2samp(a.to_numpy(dtype=float), b.to_numpy(dtype=float))
+        sig = bool(pval < alpha)
+        n_sig += int(sig)
+        ks_rows.append(
+            {"column": col, "ks_stat": float(stat), "p_value": float(pval), "significant": sig}
+        )
+        flag = "SHIFT p<0.05" if sig else ""
+        print(f"  {col:<24} {stat:10.4f} {pval:12.4g}  {flag}")
+
+    loud = abs(delta_pp) > default_rate_warn_pp or n_sig >= 3
+    if loud:
+        print(
+            "  WARNING: complete-case sample may not represent the full training "
+            "population. Causal ATE/CATE should be interpreted with this selection "
+            "in mind."
+        )
+    else:
+        print("  No loud representativeness warning (threshold: 2pp default-rate or 3+ KS shifts).")
+
+    report = {
+        "n_full": int(len(df_raw)),
+        "n_complete": int(len(df_complete)),
+        "complete_fraction": float(len(df_complete) / len(df_raw)) if len(df_raw) else None,
+        "default_rate_full": p_raw,
+        "default_rate_complete": p_cc,
+        "default_rate_delta": float(delta_pp),
+        "two_proportion_z": z_stat,
+        "two_proportion_p": p_z,
+        "chi_square": chi2,
+        "chi_square_p": p_chi,
+        "ks_alpha": alpha,
+        "n_significant_ks": int(n_sig),
+        "ks_by_column": ks_rows,
+        "loud_warning": bool(loud),
+    }
+    out_path = RESULTS_DIR / "complete_case_representativeness_v3.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+    print(f"  Wrote {out_path.relative_to(PROJECT_ROOT)}")
+    return report
 
 
 def stratified_sample(df: pd.DataFrame, n: int, seed: int = RANDOM_STATE) -> pd.DataFrame:
@@ -423,6 +521,7 @@ def main() -> int:
         raise KeyError(f"Required causal columns missing: {missing_core}")
 
     df = analysis_frame(df_raw, dag_cols)
+    check_complete_case_representativeness(df_raw, df, dag_cols, TARGET)
     nuisance_x = df[confounders + [TREATMENT_TERM, TREATMENT_GUAR]]
     tune_nuisance_lgbm(nuisance_x, df[TARGET])
 

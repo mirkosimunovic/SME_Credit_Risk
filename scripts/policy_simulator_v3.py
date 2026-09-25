@@ -1,6 +1,6 @@
-"""OOT policy simulator v3: calibrated XGBoost vs LinearDML CATE.
+"""OOT policy simulator v3: calibrated champion vs LinearDML CATE.
 
-Bridges trainer_v3.py (isotonic-calibrated XGBoost) and causal_inference_v3.py
+Bridges trainer_v3.py (isotonic-calibrated ROC-AUC champion) and causal_inference_v3.py
 Model A (Term_Years total effect; Guarantee_Ratio omitted as a mediator).
 
 Intervention: extend Term_Years by 5 for ALL baseline-rejected OOT loans
@@ -129,10 +129,16 @@ def encode_with_mapping(
     return out
 
 
-def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) -> pd.DataFrame:
+def impute_from_reference(
+    X_ref_imp: pd.DataFrame,
+    X_apply_enc: pd.DataFrame,
+    knn_stats: dict | None = None,
+) -> pd.DataFrame:
     n_ref = len(X_ref_imp)
     X_apply_aligned = X_apply_enc.reindex(columns=list(X_ref_imp.columns))
-    stacked = np.vstack([_to_numpy(X_ref_imp), _to_numpy(X_apply_aligned)])
+    ref_s = _apply_knn_scale(X_ref_imp, knn_stats, invert=False)
+    apply_s = _apply_knn_scale(X_apply_aligned, knn_stats, invert=False)
+    stacked = np.vstack([_to_numpy(ref_s), _to_numpy(apply_s)])
     print(
         f"    FastKNNImputer.fit_transform on stacked reference+apply "
         f"({stacked.shape[0]:,} rows) ...",
@@ -142,11 +148,66 @@ def impute_from_reference(X_ref_imp: pd.DataFrame, X_apply_enc: pd.DataFrame) ->
     if hasattr(imputed, "get"):
         imputed = imputed.get()
     stacked_imp = np.asarray(imputed, dtype=np.float64)
-    return pd.DataFrame(
+    apply_imp = pd.DataFrame(
         stacked_imp[n_ref:],
         columns=X_ref_imp.columns,
         index=X_apply_enc.index,
     )
+    return _apply_knn_scale(apply_imp, knn_stats, invert=True)
+
+
+def _apply_knn_scale(X: pd.DataFrame, stats: dict | None, invert: bool = False) -> pd.DataFrame:
+    if not stats or not stats.get("cols"):
+        return X.copy()
+    out = X.copy()
+    for col in stats["cols"]:
+        if col not in out.columns:
+            continue
+        mu = float(stats["mean"][col])
+        sd = float(stats["scale"][col])
+        vals = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        out[col] = vals * sd + mu if invert else (vals - mu) / sd
+    return out
+
+
+MISSING_CAT = "__MISSING__"
+
+
+def _as_cat_tokens(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        num = pd.to_numeric(series, errors="coerce")
+        out = pd.Series(pd.NA, index=series.index, dtype="string")
+        ok = num.notna()
+        if ok.any():
+            vals = num.loc[ok].to_numpy(dtype=float)
+            rounded = np.rint(vals)
+            whole = np.isclose(vals, rounded, equal_nan=False)
+            tokens = np.where(whole, rounded.astype(np.int64).astype(str), np.array([f"{v:.6g}" for v in vals]))
+            out.loc[ok] = tokens
+        return out
+    tokens = series.where(series.notna(), np.nan).astype("string").str.strip()
+    return tokens.replace({"": pd.NA, "<NA>": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+
+
+def apply_category_columns(X: pd.DataFrame, cat_cols: list[str], modes: dict[str, str]) -> pd.DataFrame:
+    out = pd.DataFrame(index=X.index)
+    for col in cat_cols:
+        if col not in X.columns:
+            out[col] = modes.get(col, MISSING_CAT)
+            continue
+        tokens = _as_cat_tokens(X[col])
+        out[col] = tokens.fillna(modes.get(col, MISSING_CAT)).astype(str)
+    return out
+
+
+def prepare_catboost_frame(X_raw, X_numeric, cat_cols, modes) -> pd.DataFrame:
+    out = X_numeric.copy()
+    if not cat_cols:
+        return out
+    cat_frame = apply_category_columns(X_raw.reindex(index=X_numeric.index), cat_cols, modes)
+    for col in cat_cols:
+        out[col] = cat_frame[col].astype(str)
+    return out
 
 
 class StackedFastKNNImputer:
@@ -156,12 +217,15 @@ class StackedFastKNNImputer:
         self.reference_: pd.DataFrame | None = None
         self.encodings_: dict = {}
         self.feature_columns_: list[str] = []
+        self.knn_scale_stats_: dict | None = None
+        self.cat_columns_: list[str] = []
+        self.cat_modes_: dict = {}
 
     def transform(self, X_raw: pd.DataFrame) -> pd.DataFrame:
         if self.reference_ is None:
             raise RuntimeError("StackedFastKNNImputer has no training reference.")
         X_enc = encode_with_mapping(X_raw, self.encodings_, self.feature_columns_)
-        return impute_from_reference(self.reference_, X_enc)
+        return impute_from_reference(self.reference_, X_enc, getattr(self, "knn_scale_stats_", None))
 
 
 def _register_imputer_for_unpickle() -> None:
@@ -209,8 +273,13 @@ def apply_frozen_scaler(X_imp: pd.DataFrame, scaler) -> pd.DataFrame:
     return X_out
 
 
-def transform_for_xgb(X_raw: pd.DataFrame, imputer, scaler) -> pd.DataFrame:
-    return apply_frozen_scaler(imputer.transform(X_raw), scaler)
+def transform_for_champion(X_raw: pd.DataFrame, imputer, scaler, meta: dict) -> pd.DataFrame:
+    X_num = apply_frozen_scaler(imputer.transform(X_raw), scaler)
+    if str(meta.get("model")) != "CatBoost":
+        return X_num
+    cat_cols = list(getattr(imputer, "cat_columns_", None) or meta.get("cat_features") or [])
+    cat_modes = dict(getattr(imputer, "cat_modes_", None) or {})
+    return prepare_catboost_frame(X_raw, X_num, cat_cols, cat_modes)
 
 
 # ---------------------------------------------------------------------------
@@ -483,12 +552,18 @@ def main() -> int:
 
     imputer_path = ARTIFACTS_DIR / "imputer_v3.joblib"
     scaler_path = ARTIFACTS_DIR / "scaler_v3.joblib"
-    model_path = ARTIFACTS_DIR / "xgboost_calibrated_v3.joblib"
-    for p in (imputer_path, scaler_path, model_path):
+    meta_path = ARTIFACTS_DIR / "champion_metadata_v3.json"
+    for p in (imputer_path, scaler_path, meta_path):
         if not p.exists():
             raise FileNotFoundError(f"Missing artifact: {p}. Run scripts/trainer_v3.py first.")
+    with open(meta_path, encoding="utf-8") as fh:
+        champ_meta = json.load(fh)
+    model_path = PROJECT_ROOT / champ_meta["calibrated_path"]
+    if not model_path.exists():
+        raise FileNotFoundError(f"Missing calibrated champion: {model_path}")
 
-    print("\n[1] Load v3 splits and frozen calibrated XGBoost pipeline")
+    print("\n[1] Load v3 splits and frozen calibrated champion pipeline")
+    print(f"  Champion={champ_meta.get('model')}  metric={champ_meta.get('champion_metric')}")
     X_train, y_train = load_xy("train")
     X_oot, _y_oot = load_xy("oot")
 
@@ -502,7 +577,7 @@ def main() -> int:
     estimate, common_causes = fit_linear_dml_model_a(dml_df)
 
     print("\n[3] Baseline XGBoost probabilities on OOT")
-    X_oot_p = transform_for_xgb(X_oot, imputer, scaler)
+    X_oot_p = transform_for_champion(X_oot, imputer, scaler, champ_meta)
     p_base = clip_p(champion.predict_proba(X_oot_p)[:, 1])
     principal = principal_amount(X_oot)
     term0 = term_years(X_oot)
@@ -530,7 +605,7 @@ def main() -> int:
     )
     term_naive = term0.copy()
     term_naive[targeted] = term0[targeted] + TERM_DELTA
-    X_oot_naive_p = transform_for_xgb(X_oot_naive, imputer, scaler)
+    X_oot_naive_p = transform_for_champion(X_oot_naive, imputer, scaler, champ_meta)
     p_naive = clip_p(champion.predict_proba(X_oot_naive_p)[:, 1])
     appr_naive, ev_naive = portfolio_from_proba(p_naive, principal, term_naive, guar)
     naive_value = float(ev_naive.sum())
