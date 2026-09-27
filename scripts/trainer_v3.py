@@ -124,6 +124,40 @@ def cat_fixed(seed: int = RANDOM_STATE) -> dict:
     )
 
 
+class CloneSafeCatBoostClassifier(CatBoostClassifier):
+    """sklearn-clone-safe CatBoost: native cats are injected at fit(), not __init__.
+
+    CatBoostClassifier(cat_features=...) mutates that parameter, so
+    RandomizedSearchCV / CalibratedClassifierCV clone() raises RuntimeError.
+    Store names on this subclass and pass them only to super().fit().
+    """
+
+    def __init__(self, cat_feature_names=None, **kwargs):
+        kwargs.pop("cat_features", None)
+        super().__init__(**kwargs)
+        # Keep the constructor object identity so sklearn.clone() can round-trip.
+        self.cat_feature_names = cat_feature_names
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep=deep)
+        params.pop("cat_features", None)
+        params["cat_feature_names"] = self.cat_feature_names
+        return params
+
+    def set_params(self, **params):
+        if "cat_feature_names" in params:
+            self.cat_feature_names = params.pop("cat_feature_names")
+        params.pop("cat_features", None)
+        super().set_params(**params)
+        return self
+
+    def fit(self, X, y=None, **kwargs):
+        names = self.cat_feature_names
+        if names:
+            kwargs.setdefault("cat_features", list(names))
+        return super().fit(X, y, **kwargs)
+
+
 XGB_SEARCH = {
     "n_estimators": [150, 300, 500],
     "max_depth": [4, 6, 8],
@@ -564,10 +598,10 @@ def tune_model(name: str, X: pd.DataFrame, y: pd.Series, cat_features: list[str]
         est = LGBMClassifier(**lgbm_fixed())
         grid = LGBM_SEARCH
     else:
-        kwargs = dict(cat_fixed())
-        if cat_features:
-            kwargs["cat_features"] = list(cat_features)
-        est = CatBoostClassifier(**kwargs)
+        est = CloneSafeCatBoostClassifier(
+            cat_feature_names=list(cat_features) if cat_features else None,
+            **cat_fixed(),
+        )
         grid = CAT_SEARCH
     search = RandomizedSearchCV(
         est,
@@ -598,10 +632,10 @@ def instantiate_tuned(
         return XGBClassifier(**xgb_fixed(seed), **params)
     if name == "LightGBM":
         return LGBMClassifier(**lgbm_fixed(seed), **params)
-    kwargs = dict(cat_fixed(seed))
-    if cat_features:
-        kwargs["cat_features"] = list(cat_features)
-    return CatBoostClassifier(**{**kwargs, **params})
+    return CloneSafeCatBoostClassifier(
+        cat_feature_names=list(cat_features) if cat_features else None,
+        **{**cat_fixed(seed), **params},
+    )
 
 
 def bootstrap_auc_ci(

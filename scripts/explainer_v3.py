@@ -266,12 +266,20 @@ def instantiate_stability_model(name: str, params: dict, seed: int, cat_features
         )
     if name == "LightGBM":
         return LGBMClassifier(random_state=seed, verbosity=-1, n_jobs=-1, **params)
-    kwargs = dict(params)
-    if cat_features:
-        kwargs["cat_features"] = list(cat_features)
-    return CatBoostClassifier(
-        random_seed=seed, verbose=False, allow_writing_files=False, **kwargs
+    model = CatBoostClassifier(
+        random_seed=seed, verbose=False, allow_writing_files=False, **params
     )
+    model.cat_feature_names = list(cat_features) if cat_features else None
+    original_fit = model.fit
+
+    def _fit(X, y=None, **kwargs):
+        names = getattr(model, "cat_feature_names", None)
+        if names:
+            kwargs.setdefault("cat_features", list(names))
+        return original_fit(X, y, **kwargs)
+
+    model.fit = _fit
+    return model
 
 
 def load_raw_champion(meta: dict):
