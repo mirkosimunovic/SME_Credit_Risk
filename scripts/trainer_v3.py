@@ -158,6 +158,9 @@ class CloneSafeCatBoostClassifier(CatBoostClassifier):
         return super().fit(X, y, **kwargs)
 
 
+CloneSafeCatBoostClassifier.__module__ = "trainer_v3"
+
+
 XGB_SEARCH = {
     "n_estimators": [150, 300, 500],
     "max_depth": [4, 6, 8],

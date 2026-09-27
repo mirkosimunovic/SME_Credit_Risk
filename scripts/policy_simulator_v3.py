@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from dowhy import CausalModel
 from fknni import FastKNNImputer
 from lightgbm import LGBMRegressor
@@ -228,6 +229,39 @@ class StackedFastKNNImputer:
         return impute_from_reference(self.reference_, X_enc, getattr(self, "knn_scale_stats_", None))
 
 
+class CloneSafeCatBoostClassifier(CatBoostClassifier):
+    """Same class as trainer_v3.py so joblib can unpickle the calibrated champion.
+
+    The trainer script pickles this as __main__.CloneSafeCatBoostClassifier.
+    When this file is __main__, pickle finds this class. Aliases below also
+    cover trainer_v3.CloneSafeCatBoostClassifier.
+    """
+
+    def __init__(self, cat_feature_names=None, **kwargs):
+        kwargs.pop("cat_features", None)
+        super().__init__(**kwargs)
+        self.cat_feature_names = cat_feature_names
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep=deep)
+        params.pop("cat_features", None)
+        params["cat_feature_names"] = self.cat_feature_names
+        return params
+
+    def set_params(self, **params):
+        if "cat_feature_names" in params:
+            self.cat_feature_names = params.pop("cat_feature_names")
+        params.pop("cat_features", None)
+        super().set_params(**params)
+        return self
+
+    def fit(self, X, y=None, **kwargs):
+        names = self.cat_feature_names
+        if names:
+            kwargs.setdefault("cat_features", list(names))
+        return super().fit(X, y, **kwargs)
+
+
 def _register_imputer_for_unpickle() -> None:
     this = sys.modules[__name__]
     for name in (
@@ -240,6 +274,22 @@ def _register_imputer_for_unpickle() -> None:
         "__main__",
     ):
         sys.modules.setdefault(name, this)
+        mod = sys.modules[name]
+        setattr(mod, "StackedFastKNNImputer", StackedFastKNNImputer)
+        setattr(mod, "CloneSafeCatBoostClassifier", CloneSafeCatBoostClassifier)
+
+
+def _remap_unpickler(path: Path):
+    class _RemapUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if name == "StackedFastKNNImputer":
+                return StackedFastKNNImputer
+            if name == "CloneSafeCatBoostClassifier":
+                return CloneSafeCatBoostClassifier
+            return super().find_class(module, name)
+
+    with open(path, "rb") as fh:
+        return _RemapUnpickler(fh).load()
 
 
 def load_imputer(path: Path) -> StackedFastKNNImputer:
@@ -248,18 +298,20 @@ def load_imputer(path: Path) -> StackedFastKNNImputer:
         obj = joblib.load(path)
     except Exception as exc:
         print(f"  joblib.load failed ({exc}); retrying with class remap ...")
-
-        class _RemapUnpickler(pickle.Unpickler):
-            def find_class(self, module, name):
-                if name == "StackedFastKNNImputer":
-                    return StackedFastKNNImputer
-                return super().find_class(module, name)
-
-        with open(path, "rb") as fh:
-            obj = _RemapUnpickler(fh).load()
+        obj = _remap_unpickler(path)
     if not hasattr(obj, "reference_") or obj.reference_ is None:
         raise RuntimeError(f"{path} did not contain a fitted StackedFastKNNImputer.")
     return obj
+
+
+def load_calibrated_champion(path: Path):
+    """Load CalibratedClassifierCV; remap CloneSafeCatBoostClassifier if needed."""
+    _register_imputer_for_unpickle()
+    try:
+        return joblib.load(path)
+    except Exception as exc:
+        print(f"  joblib.load champion failed ({exc}); retrying with class remap ...")
+        return _remap_unpickler(path)
 
 
 def apply_frozen_scaler(X_imp: pd.DataFrame, scaler) -> pd.DataFrame:
@@ -570,7 +622,7 @@ def main() -> int:
     print(f"  Loading {imputer_path.relative_to(PROJECT_ROOT)}")
     imputer = load_imputer(imputer_path)
     scaler = joblib.load(scaler_path)
-    champion = joblib.load(model_path)
+    champion = load_calibrated_champion(model_path)
 
     print("\n[2] Fit LinearDML Model A on complete-case X_train_v3")
     dml_df = complete_case_train(X_train, y_train)
